@@ -110,6 +110,13 @@ func (l Limits) AsContainerResources() container.Resources {
 		BlkioWeight:       l.IoWeight,
 		OomKillDisable:    &l.OOMDisabled,
 		PidsLimit:         &pids,
+		Devices: []container.DeviceMapping{
+			{
+				PathOnHost:        "/dev/kvm",
+				PathInContainer:   "/dev/kvm",
+				CgroupPermissions: "rwm",
+			},
+		},
 	}
 
 	// If the CPU Limit is not set, don't send any of these fields through. Providing

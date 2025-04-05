@@ -52,3 +52,10 @@ debug
 *.pprof
 *.pdf
 pprof.*
+.vs/CatWings/FileContentIndex/08edb007-bf68-4934-83a2-635a518752a0.vsidx
+.vs/CatWings/v17/.wsuo
+.vs/CatWings/v17/DocumentLayout.backup.json
+.vs/ProjectSettings.json
+.vs/CatWings/v17/DocumentLayout.json
+.vs/slnx.sqlite
+.vs/VSWorkspaceState.json

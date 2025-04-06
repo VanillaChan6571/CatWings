@@ -508,7 +508,7 @@ func (fs *Filesystem) CompressFiles(dir string, paths []string) (ufs.FileInfo, e
 
 	cw := ufs.NewCountedWriter(f)
 
-	// If it's a ZIP file, start progress monitoring
+	// If it's ao ZIP file, start progress monitoring
 	if format == backup.FormatZip {
 		monitor := backup.NewZipProgressMonitor(d, filepath.Base(d), fs.EventBus())
 		defer monitor.Stop()

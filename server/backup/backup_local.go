@@ -20,23 +20,40 @@ type LocalBackup struct {
 
 var _ BackupInterface = (*LocalBackup)(nil)
 
+// NewLocal update to include format
 func NewLocal(client remote.Client, uuid string, ignore string) *LocalBackup {
 	return &LocalBackup{
-		Backup{
+		Backup: Backup{
 			client:  client,
 			Uuid:    uuid,
 			Ignore:  ignore,
 			adapter: LocalBackupAdapter,
+			format:  DefaultFormat, // Use default format
 		},
 	}
 }
 
 // LocateLocal finds the backup for a server and returns the local path. This
 // will obviously only work if the backup was created as a local backup.
+// LocateLocal update to detect format from file
 func LocateLocal(client remote.Client, uuid string) (*LocalBackup, os.FileInfo, error) {
+	// Try with the default format first
 	b := NewLocal(client, uuid, "")
 	st, err := os.Stat(b.Path())
-	if err != nil {
+
+	// If not found, try the alternate format
+	if err != nil && os.IsNotExist(err) {
+		alternateFormat := FormatTarGz
+		if DefaultFormat == FormatTarGz {
+			alternateFormat = FormatZip
+		}
+
+		b.format = alternateFormat
+		st, err = os.Stat(b.Path())
+		if err != nil {
+			return nil, nil, err
+		}
+	} else if err != nil {
 		return nil, nil, err
 	}
 
@@ -80,6 +97,7 @@ func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem,
 
 // Restore will walk over the archive and call the callback function for each
 // file encountered.
+// Restore method update to handle different formats
 func (b *LocalBackup) Restore(ctx context.Context, _ io.Reader, callback RestoreCallback) error {
 	f, err := os.Open(b.Path())
 	if err != nil {
@@ -93,7 +111,10 @@ func (b *LocalBackup) Restore(ctx context.Context, _ io.Reader, callback Restore
 	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
 		reader = ratelimit.Reader(f, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
 	}
-	if err := format.Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
+
+	// Use the format from the backup path
+	format := GetFormatFromPath(b.Path()).GetFormat()
+	if err := format.(archives.Extraction).Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
 		r, err := f.Open()
 		if err != nil {
 			return err

@@ -25,13 +25,15 @@ type S3Backup struct {
 
 var _ BackupInterface = (*S3Backup)(nil)
 
+// NewS3 update to include format
 func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
 	return &S3Backup{
-		Backup{
+		Backup: Backup{
 			client:  client,
 			Uuid:    uuid,
 			Ignore:  ignore,
 			adapter: S3BackupAdapter,
+			format:  DefaultFormat, // Use default format
 		},
 	}
 }

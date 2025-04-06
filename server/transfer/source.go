@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/pterodactyl/wings/internal/progress"
+	"github.com/pterodactyl/wings/server/backup"
 )
 
 // PushArchiveToTarget POSTs the archive to the target node and returns the
@@ -61,6 +62,10 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 	mp := multipart.NewWriter(writer)
 	defer mp.Close()
 	req.Header.Set("Content-Type", mp.FormDataContentType())
+
+	// Set the archive format in the request headers to inform the target node
+	// which format is being used for this transfer
+	req.Header.Set("X-Archive-Format", string(backup.FormatTarGz))
 
 	// Create a new goroutine to write the archive to the pipe used by the
 	// multipart writer.

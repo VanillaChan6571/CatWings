@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/pterodactyl/wings/internal/progress"
+	"github.com/pterodactyl/wings/server/backup"
 	"github.com/pterodactyl/wings/server/filesystem"
 )
 
@@ -19,8 +20,12 @@ func (t *Transfer) Archive() (*Archive, error) {
 			return nil, fmt.Errorf("transfer: failed to get server disk usage: %w", err)
 		}
 
+		// For transfers, always use tar.gz format for compatibility
+		// regardless of the configured default
+		format := backup.FormatTarGz
+
 		// Create a new archive instance and assign it to the transfer.
-		t.archive = NewArchive(t, uint64(rawSize))
+		t.archive = NewArchive(t, uint64(rawSize), format)
 	}
 
 	return t.archive, nil
@@ -32,11 +37,12 @@ type Archive struct {
 }
 
 // NewArchive returns a new archive associated with the given transfer.
-func NewArchive(t *Transfer, size uint64) *Archive {
+func NewArchive(t *Transfer, size uint64, format backup.ArchiveFormat) *Archive {
 	return &Archive{
 		archive: &filesystem.Archive{
 			Filesystem: t.Server.Filesystem(),
 			Progress:   progress.NewProgress(size),
+			Format:     format, // Use specified format
 		},
 	}
 }

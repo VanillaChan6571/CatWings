@@ -2,13 +2,17 @@ package filesystem
 
 import (
 	"archive/tar"
+	"compress/flate"
 	"context"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -17,8 +21,10 @@ import (
 	ignore "github.com/sabhiram/go-gitignore"
 
 	"github.com/pterodactyl/wings/config"
+	"github.com/pterodactyl/wings/events"
 	"github.com/pterodactyl/wings/internal/progress"
 	"github.com/pterodactyl/wings/internal/ufs"
+	"github.com/pterodactyl/wings/server/backup"
 )
 
 const memory = 4 * 1024
@@ -55,6 +61,7 @@ func (p *TarProgress) Write(v []byte) (int, error) {
 	return p.p.Write(v)
 }
 
+// Add format and events fields to Archive struct
 type Archive struct {
 	// Filesystem to create the archive with.
 	Filesystem *Filesystem
@@ -74,7 +81,18 @@ type Archive struct {
 	// Progress wraps the writer of the archive to pass through the progress tracker.
 	Progress *progress.Progress
 
-	w *TarProgress
+	// Format specifies the archive format to use
+	Format backup.ArchiveFormat
+
+	// EventBus for sending progress notifications
+	events *events.Bus
+
+	w interface{} // Either *TarProgress or *zip.Writer
+}
+
+// EventBus returns the event bus used by this filesystem
+func (fs *Filesystem) EventBus() *events.Bus {
+	return fs.eventBus
 }
 
 // Create creates an archive at dst with all the files defined in the
@@ -83,6 +101,11 @@ type Archive struct {
 // THIS IS UNSAFE TO USE IF `dst` IS PROVIDED BY A USER! ONLY USE THIS WITH
 // CONTROLLED PATHS!
 func (a *Archive) Create(ctx context.Context, dst string) error {
+	// If format is not set, use the default
+	if a.Format == "" {
+		a.Format = backup.DefaultFormat
+	}
+
 	// Using os.OpenFile here is expected, as long as `dst` is not a user
 	// provided path.
 	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
@@ -113,6 +136,11 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 		return errors.New("filesystem: archive.Filesystem is unset")
 	}
 
+	// If format is not set, use the default
+	if a.Format == "" {
+		a.Format = backup.DefaultFormat
+	}
+
 	// The base directory may come with a prefixed `/`, strip it to prevent
 	// problems.
 	a.BaseDirectory = strings.TrimPrefix(a.BaseDirectory, "/")
@@ -129,29 +157,53 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 		a.Files = files
 	}
 
-	// Choose which compression level to use based on the compression_level configuration option
-	var compressionLevel int
-	switch config.Get().System.Backups.CompressionLevel {
-	case "none":
-		compressionLevel = pgzip.NoCompression
-	case "best_compression":
-		compressionLevel = pgzip.BestCompression
-	default:
-		compressionLevel = pgzip.BestSpeed
-	}
-
-	// Create a new gzip writer around the file.
-	gw, _ := pgzip.NewWriterLevel(w, compressionLevel)
-	_ = gw.SetConcurrency(1<<20, 1)
-	defer gw.Close()
-
-	// Create a new tar writer around the gzip writer.
-	tw := tar.NewWriter(gw)
-	defer tw.Close()
-
-	a.w = NewTarProgress(tw, a.Progress)
-
 	fs := a.Filesystem.unixFS
+
+	// Initialize the appropriate archive writer based on format
+	switch a.Format {
+	case backup.FormatZip:
+		// Choose which compression level to use based on the compression_level configuration option
+		var compressionLevel int
+		switch config.Get().System.Backups.CompressionLevel {
+		case "none":
+			compressionLevel = zip.Store
+		case "best_compression":
+			compressionLevel = zip.BestCompression
+		default:
+			compressionLevel = zip.BestSpeed
+		}
+
+		// Create a new ZIP writer around the provided writer
+		zw := zip.NewWriter(w)
+		zw.RegisterCompressor(zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
+			return flate.NewWriter(out, compressionLevel)
+		})
+		defer zw.Close()
+		a.w = zw
+
+	case backup.FormatTarGz:
+		// Choose which compression level to use based on the compression_level configuration option
+		var compressionLevel int
+		switch config.Get().System.Backups.CompressionLevel {
+		case "none":
+			compressionLevel = pgzip.NoCompression
+		case "best_compression":
+			compressionLevel = pgzip.BestCompression
+		default:
+			compressionLevel = pgzip.BestSpeed
+		}
+
+		// Create a new gzip writer around the file.
+		gw, _ := pgzip.NewWriterLevel(w, compressionLevel)
+		_ = gw.SetConcurrency(1<<20, 1)
+		defer gw.Close()
+
+		// Create a new tar writer around the gzip writer.
+		tw := tar.NewWriter(gw)
+		defer tw.Close()
+
+		a.w = NewTarProgress(tw, a.Progress)
+	}
 
 	// If we're specifically looking for only certain files, or have requested
 	// that certain files be ignored we'll update the callback function to reflect
@@ -260,6 +312,7 @@ func (a *Archive) withFilesCallback() walkFunc {
 }
 
 // Adds a given file path to the final archive being created.
+// Modify addToArchive method to handle different archive formats
 func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEntry) error {
 	s, err := entry.Info()
 	if err != nil {
@@ -269,8 +322,7 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		return errors.WrapIff(err, "failed executing os.Lstat on '%s'", name)
 	}
 
-	// Skip socket files as they are unsupported by archive/tar.
-	// Error will come from tar#FileInfoHeader: "archive/tar: sockets not supported"
+	// Skip socket files as they are unsupported by archives
 	if s.Mode()&fs.ModeSocket != 0 {
 		return nil
 	}
@@ -278,13 +330,8 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 	// Resolve the symlink target if the file is a symlink.
 	var target string
 	if s.Mode()&fs.ModeSymlink != 0 {
-		// Read the target of the symlink. If there are any errors we will dump them out to
-		// the logs, but we're not going to stop the backup. There are far too many cases of
-		// symlinks causing all sorts of unnecessary pain in this process. Sucks to suck if
-		// it doesn't work.
 		target, err = os.Readlink(s.Name())
 		if err != nil {
-			// Ignore the not exist errors specifically, since there is nothing important about that.
 			if !os.IsNotExist(err) {
 				log.WithField("name", name).WithField("readlink_err", err.Error()).Warn("failed reading symlink for target path; skipping...")
 			}
@@ -292,6 +339,92 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		}
 	}
 
+	switch a.Format {
+	case backup.FormatZip:
+		return a.addToZip(dirfd, name, relative, s, target)
+	default: // FormatTarGz
+		return a.addToTarGz(dirfd, name, relative, s, target)
+	}
+}
+
+// addToZip adds a file to a ZIP archive
+func (a *Archive) addToZip(dirfd int, name, relative string, s os.FileInfo, target string) error {
+	// Get ZIP header
+	header, err := zip.FileInfoHeader(s)
+	if err != nil {
+		return errors.WrapIff(err, "failed to get zip.FileInfoHeader for '%s'", name)
+	}
+
+	// Set the name in the header
+	header.Name = relative
+
+	// For symlinks, store the target path
+	if s.Mode()&fs.ModeSymlink != 0 {
+		header.Method = zip.Store
+		header.Name = header.Name + ".symlink"
+	} else if s.Mode().IsDir() {
+		// If it's a directory, ensure it ends with a slash
+		header.Name = strings.TrimSuffix(header.Name, "/") + "/"
+		header.Method = zip.Store
+	} else {
+		// Use deflate for regular files
+		header.Method = zip.Deflate
+	}
+
+	// Create the file entry in the ZIP
+	zw, ok := a.w.(*zip.Writer)
+	if !ok {
+		return errors.New("archive writer is not a ZIP writer")
+	}
+
+	writer, err := zw.CreateHeader(header)
+	if err != nil {
+		return errors.WrapIff(err, "failed to create zip entry for '%s'", relative)
+	}
+
+	// If it's a symlink, write the target path
+	if s.Mode()&fs.ModeSymlink != 0 {
+		_, err = writer.Write([]byte(target))
+		return err
+	}
+
+	// If it's a directory or zero-byte file, no need to write anything
+	if s.IsDir() || s.Size() == 0 {
+		return nil
+	}
+
+	// Open and copy the file
+	f, err := a.Filesystem.unixFS.OpenFileat(dirfd, name, ufs.O_RDONLY, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return errors.WrapIff(err, "failed to open '%s' for copying", relative)
+	}
+	defer f.Close()
+
+	// Get buffer for copying
+	var buf []byte
+	if s.Size() < memory {
+		buf = make([]byte, s.Size())
+	} else {
+		buf = pool.Get().([]byte)
+		defer func() {
+			buf = make([]byte, memory)
+			pool.Put(buf)
+		}()
+	}
+
+	// Copy the file to the ZIP
+	if _, err := io.CopyBuffer(writer, io.LimitReader(f, s.Size()), buf); err != nil {
+		return errors.WrapIff(err, "failed to copy '%s' to zip archive", relative)
+	}
+
+	return nil
+}
+
+// addToTarGz adds a file to a tar.gz archive (existing implementation)
+func (a *Archive) addToTarGz(dirfd int, name, relative string, s os.FileInfo, target string) error {
 	// Get the tar FileInfoHeader in order to add the file to the archive.
 	header, err := tar.FileInfoHeader(s, filepath.ToSlash(target))
 	if err != nil {
@@ -303,8 +436,13 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		header.Name = relative
 	}
 
+	tp, ok := a.w.(*TarProgress)
+	if !ok {
+		return errors.New("archive writer is not a TarProgress writer")
+	}
+
 	// Write the tar FileInfoHeader to the archive.
-	if err := a.w.WriteHeader(header); err != nil {
+	if err := tp.WriteHeader(header); err != nil {
 		return errors.WrapIff(err, "failed to write tar#FileInfoHeader for '%s'", name)
 	}
 
@@ -337,8 +475,55 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 	defer f.Close()
 
 	// Copy the file's contents to the archive using our buffer.
-	if _, err := io.CopyBuffer(a.w, io.LimitReader(f, header.Size), buf); err != nil {
+	if _, err := io.CopyBuffer(tp, io.LimitReader(f, header.Size), buf); err != nil {
 		return errors.WrapIff(err, "failed to copy '%s' to archive", header.Name)
 	}
 	return nil
+}
+
+// CompressFiles update to handle both formats
+func (fs *Filesystem) CompressFiles(dir string, paths []string) (ufs.FileInfo, error) {
+	format := backup.DefaultFormat
+	a := &Archive{
+		Filesystem:    fs,
+		BaseDirectory: dir,
+		Files:         paths,
+		Format:        format,
+		events:        fs.EventBus(),
+	}
+
+	// Determine archive name with the correct extension
+	d := path.Join(
+		dir,
+		fmt.Sprintf("archive-%s%s",
+			strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", ""),
+			format.GetExtension()),
+	)
+
+	f, err := fs.unixFS.OpenFile(d, ufs.O_WRONLY|ufs.O_CREATE, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	cw := ufs.NewCountedWriter(f)
+
+	// If it's a ZIP file, start progress monitoring
+	if format == backup.FormatZip {
+		monitor := backup.NewZipProgressMonitor(d, filepath.Base(d), fs.EventBus())
+		defer monitor.Stop()
+		monitor.Start(context.Background())
+	}
+
+	if err := a.Stream(context.Background(), cw); err != nil {
+		return nil, err
+	}
+
+	if !fs.unixFS.CanFit(cw.BytesWritten()) {
+		_ = fs.unixFS.Remove(d)
+		return nil, newFilesystemError(ErrCodeDiskSpace, nil)
+	}
+
+	fs.unixFS.Add(cw.BytesWritten())
+	return f.Stat()
 }

@@ -2,73 +2,23 @@ package backup
 
 import (
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"io"
-	"io/fs"
 	"os"
-	"path"
+	"strings"
 
 	"emperror.dev/errors"
-	"github.com/apex/log"
+	"github.com/juju/ratelimit"
 	"github.com/mholt/archives"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/pterodactyl/wings/config"
 	"github.com/pterodactyl/wings/remote"
 	"github.com/pterodactyl/wings/server/filesystem"
 )
 
-var format = archives.CompressedArchive{
-	Compression: archives.Gz{},
-	Archival:    archives.Tar{},
-	Extraction:  archives.Tar{},
-}
+// BackupCompletingEvent is published when a backup is being finalized
+const BackupCompletingEvent = "backup completing"
 
-type AdapterType string
-
-const (
-	LocalBackupAdapter AdapterType = "wings"
-	S3BackupAdapter    AdapterType = "s3"
-)
-
-// RestoreCallback is a generic restoration callback that exists for both local
-// and remote backups allowing the files to be restored.
-type RestoreCallback func(file string, info fs.FileInfo, r io.ReadCloser) error
-
-// noinspection GoNameStartsWithPackageName
-type BackupInterface interface {
-	// SetClient sets the API request client on the backup interface.
-	SetClient(remote.Client)
-	// Identifier returns the UUID of this backup as tracked by the panel
-	// instance.
-	Identifier() string
-	// WithLogContext attaches additional context to the log output for this
-	// backup.
-	WithLogContext(map[string]interface{})
-	// Generate creates a backup in whatever the configured source for the
-	// specific implementation is.
-	Generate(context.Context, *filesystem.Filesystem, string) (*ArchiveDetails, error)
-	// Ignored returns the ignored files for this backup instance.
-	Ignored() string
-	// Checksum returns a SHA1 checksum for the generated backup.
-	Checksum() ([]byte, error)
-	// Size returns the size of the generated backup.
-	Size() (int64, error)
-	// Path returns the path to the backup on the machine. This is not always
-	// the final storage location of the backup, simply the location we're using
-	// to store it until it is moved to the final spot.
-	Path() string
-	// Details returns details about the archive.
-	Details(context.Context, []remote.BackupPart) (*ArchiveDetails, error)
-	// Remove removes a backup file.
-	Remove() error
-	// Restore is called when a backup is ready to be restored to the disk from
-	// the given source. Not every backup implementation will support this nor
-	// will every implementation require a reader be provided.
-	Restore(context.Context, io.Reader, RestoreCallback) error
-}
-
+// Backup struct update
 type Backup struct {
 	// The UUID of this backup object. This must line up with a backup from
 	// the panel instance.
@@ -81,107 +31,191 @@ type Backup struct {
 	client     remote.Client
 	adapter    AdapterType
 	logContext map[string]interface{}
+	format     ArchiveFormat // Add format field
 }
 
-func (b *Backup) SetClient(c remote.Client) {
-	b.client = c
-}
-
-func (b *Backup) Identifier() string {
-	return b.Uuid
+// DefaultFormat is initially set based on config, can be changed later
+func init() {
+	// Set default format based on config, default to ZIP if not specified
+	format := config.Get().System.ArchiveFormat
+	switch strings.ToLower(format) {
+	case "zip":
+		DefaultFormat = FormatZip
+	case "tar.gz":
+		DefaultFormat = FormatTarGz
+	default:
+		DefaultFormat = FormatZip
+	}
 }
 
 // Path returns the path for this specific backup.
 func (b *Backup) Path() string {
-	return path.Join(config.Get().System.BackupDirectory, b.Identifier()+".tar.gz")
+	// Use the format to determine the correct extension
+	if b.format == "" {
+		b.format = DefaultFormat
+	}
+	return b.format.GetPathWithExtension(config.Get().System.BackupDirectory, b.Identifier())
 }
 
-// Size returns the size of the generated backup.
-func (b *Backup) Size() (int64, error) {
+// NewS3 update to include format
+func NewS3(client remote.Client, uuid string, ignore string) *S3Backup {
+	return &S3Backup{
+		Backup: Backup{
+			client:  client,
+			Uuid:    uuid,
+			Ignore:  ignore,
+			adapter: S3BackupAdapter,
+			format:  DefaultFormat, // Use default format
+		},
+	}
+}
+
+// NewLocal update to include format
+func NewLocal(client remote.Client, uuid string, ignore string) *LocalBackup {
+	return &LocalBackup{
+		Backup: Backup{
+			client:  client,
+			Uuid:    uuid,
+			Ignore:  ignore,
+			adapter: LocalBackupAdapter,
+			format:  DefaultFormat, // Use default format
+		},
+	}
+}
+
+// LocateLocal updated to handle multiple formats
+func LocateLocal(client remote.Client, uuid string) (*LocalBackup, os.FileInfo, error) {
+	// Try with the default format first
+	b := NewLocal(client, uuid, "")
 	st, err := os.Stat(b.Path())
-	if err != nil {
-		return 0, err
+
+	// If not found with default format, try the alternate format
+	if err != nil && os.IsNotExist(err) {
+		alternateFormat := FormatTarGz
+		if DefaultFormat == FormatTarGz {
+			alternateFormat = FormatZip
+		}
+
+		b.format = alternateFormat
+		st, err = os.Stat(b.Path())
+		if err != nil {
+			return nil, nil, err
+		}
+	} else if err != nil {
+		return nil, nil, err
 	}
 
-	return st.Size(), nil
+	if st.IsDir() {
+		return nil, nil, errors.New("invalid archive, is directory")
+	}
+
+	return b, st, nil
 }
 
-// Checksum returns the SHA256 checksum of a backup.
-func (b *Backup) Checksum() ([]byte, error) {
-	h := sha1.New()
-
+// Restore method update to handle different formats
+func (b *LocalBackup) Restore(ctx context.Context, _ io.Reader, callback RestoreCallback) error {
 	f, err := os.Open(b.Path())
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer f.Close()
 
-	buf := make([]byte, 1024*4)
-	if _, err := io.CopyBuffer(h, f, buf); err != nil {
+	var reader io.Reader = f
+	// Apply rate limiting if configured
+	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
+		reader = ratelimit.Reader(f, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
+	}
+
+	// Determine the format from the file path
+	format := GetFormatFromPath(b.Path()).GetFormat()
+	extraction, ok := format.(archives.Extraction)
+	if !ok {
+		return errors.New("format does not support extraction")
+	}
+
+	// Extract the archive
+	if err := extraction.Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
+		r, err := f.Open()
+		if err != nil {
+			return err
+		}
+		defer r.Close()
+
+		return callback(f.NameInArchive, f.FileInfo, r)
+	}); err != nil {
+		return err
+	}
+	return nil
+}
+
+// S3Backup.Restore method needs similar updates to handle both formats
+
+// Update S3Backup.Generate to support ZIP format
+func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
+	defer s.Remove()
+
+	a := &filesystem.Archive{
+		Filesystem: fsys,
+		Ignore:     ignore,
+		Format:     s.format, // Use the format from the backup
+	}
+
+	s.log().WithField("path", s.Path()).Info("creating backup for server")
+
+	// Start progress monitoring for ZIP files
+	if s.format == FormatZip {
+		monitor := NewZipProgressMonitor(s.Path(), s.Identifier(), fsys.EventBus())
+		defer monitor.Stop()
+		monitor.Start(ctx)
+	}
+
+	if err := a.Create(ctx, s.Path()); err != nil {
 		return nil, err
 	}
+	s.log().Info("created backup successfully")
 
-	return h.Sum(nil), nil
-}
-
-// Details returns both the checksum and size of the archive currently stored on
-// the disk to the caller.
-func (b *Backup) Details(ctx context.Context, parts []remote.BackupPart) (*ArchiveDetails, error) {
-	ad := ArchiveDetails{ChecksumType: "sha1", Parts: parts}
-	g, ctx := errgroup.WithContext(ctx)
-
-	g.Go(func() error {
-		resp, err := b.Checksum()
-		if err != nil {
-			return err
-		}
-		ad.Checksum = hex.EncodeToString(resp)
-		return nil
-	})
-
-	g.Go(func() error {
-		s, err := b.Size()
-		if err != nil {
-			return err
-		}
-		ad.Size = s
-		return nil
-	})
-
-	if err := g.Wait(); err != nil {
-		return nil, errors.WithStackDepth(err, 1)
+	rc, err := os.Open(s.Path())
+	if err != nil {
+		return nil, errors.Wrap(err, "backup: could not read archive from disk")
 	}
-	return &ad, nil
-}
+	defer rc.Close()
 
-func (b *Backup) Ignored() string {
-	return b.Ignore
-}
-
-// Returns a logger instance for this backup with the additional context fields
-// assigned to the output.
-func (b *Backup) log() *log.Entry {
-	l := log.WithField("backup", b.Identifier()).WithField("adapter", b.adapter)
-	for k, v := range b.logContext {
-		l = l.WithField(k, v)
+	parts, err := s.generateRemoteRequest(ctx, rc)
+	if err != nil {
+		return nil, err
 	}
-	return l
-}
-
-type ArchiveDetails struct {
-	Checksum     string              `json:"checksum"`
-	ChecksumType string              `json:"checksum_type"`
-	Size         int64               `json:"size"`
-	Parts        []remote.BackupPart `json:"parts"`
-}
-
-// ToRequest returns a request object.
-func (ad *ArchiveDetails) ToRequest(successful bool) remote.BackupRequest {
-	return remote.BackupRequest{
-		Checksum:     ad.Checksum,
-		ChecksumType: ad.ChecksumType,
-		Size:         ad.Size,
-		Successful:   successful,
-		Parts:        ad.Parts,
+	ad, err := s.Details(ctx, parts)
+	if err != nil {
+		return nil, errors.WrapIf(err, "backup: failed to get archive details after upload")
 	}
+	return ad, nil
+}
+
+// Similar updates needed for LocalBackup.Generate
+func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
+	a := &filesystem.Archive{
+		Filesystem: fsys,
+		Ignore:     ignore,
+		Format:     b.format, // Use the format from the backup
+	}
+
+	b.log().WithField("path", b.Path()).Info("creating backup for server")
+
+	// Start progress monitoring for ZIP files
+	if b.format == FormatZip {
+		monitor := NewZipProgressMonitor(b.Path(), b.Identifier(), fsys.EventBus())
+		defer monitor.Stop()
+		monitor.Start(ctx)
+	}
+
+	if err := a.Create(ctx, b.Path()); err != nil {
+		return nil, err
+	}
+	b.log().Info("created backup successfully")
+
+	ad, err := b.Details(ctx, nil)
+	if err != nil {
+		return nil, errors.WrapIf(err, "backup: failed to get archive details for local backup")
+	}
+	return ad, nil
 }

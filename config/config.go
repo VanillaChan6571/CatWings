@@ -135,6 +135,9 @@ type SystemConfiguration struct {
 	// Directory where server archives for transferring will be stored.
 	ArchiveDirectory string `default:"/var/lib/pterodactyl/archives" json:"-" yaml:"archive_directory"`
 
+	// ArchiveFormat sets the format to use for backups and archives
+	ArchiveFormat string `default:"zip" json:"archive_format"`
+
 	// Directory where local backups will be stored on the machine.
 	BackupDirectory string `default:"/var/lib/pterodactyl/backups" json:"-" yaml:"backup_directory"`
 

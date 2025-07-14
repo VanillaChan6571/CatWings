@@ -16,7 +16,6 @@ import (
 	"github.com/mholt/archives"
 
 	"github.com/pterodactyl/wings/internal/ufs"
-	"github.com/pterodactyl/wings/server/backup"
 	"github.com/pterodactyl/wings/server/filesystem/archiverext"
 )
 
@@ -30,8 +29,8 @@ import (
 // and the compressed file will be placed at that location named
 // `archive-{date}.zip`.
 func (fs *Filesystem) CompressFiles(dir string, paths []string) (ufs.FileInfo, error) {
-	// Use our new ZIP-based BackupArchive instead of the old tar-based Archive
-	ba := &backup.BackupArchive{
+	// Use our new ZIP-based BackupArchive
+	ba := &BackupArchive{
 		Filesystem:    fs,
 		BaseDirectory: dir,
 		Files:         paths,

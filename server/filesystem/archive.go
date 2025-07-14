@@ -1,212 +1,320 @@
 package filesystem
 
 import (
-	"archive/zip"
+	"archive/tar"
 	"context"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
+	"sync"
 
 	"emperror.dev/errors"
+	"github.com/apex/log"
+	"github.com/juju/ratelimit"
+	"github.com/klauspost/pgzip"
+	ignore "github.com/sabhiram/go-gitignore"
 
 	"github.com/pterodactyl/wings/config"
+	"github.com/pterodactyl/wings/internal/progress"
 	"github.com/pterodactyl/wings/internal/ufs"
 )
 
-// BackupArchive represents a ZIP archive specifically for backups
-type BackupArchive struct {
-	BaseDirectory string
-	Files         []string
-	Ignore        string
-	Progress      *int64
-	Filesystem    *Filesystem
+const memory = 4 * 1024
+
+var pool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, memory)
+		return b
+	},
 }
 
-// Stream creates a ZIP archive and streams it to the writer
-func (ba *BackupArchive) Stream(ctx context.Context, w io.Writer) error {
-	if ba.Filesystem == nil {
-		return errors.New("filesystem: BackupArchive.Filesystem is unset")
+// SkipThis is used as a return value to indicate that a file should be skipped.
+var SkipThis = errors.New("skip this file")
+
+// TarProgress .
+type TarProgress struct {
+	*tar.Writer
+	p *progress.Progress
+}
+
+// NewTarProgress .
+func NewTarProgress(w *tar.Writer, p *progress.Progress) *TarProgress {
+	if p != nil {
+		p.Writer = w
+	}
+	return &TarProgress{
+		Writer: w,
+		p:      p,
+	}
+}
+
+// Write .
+func (p *TarProgress) Write(v []byte) (int, error) {
+	if p.p == nil {
+		return p.Writer.Write(v)
+	}
+	return p.p.Write(v)
+}
+
+// Archive represents the original tar.gz archive used for transfers
+type Archive struct {
+	// Filesystem to create the archive with.
+	Filesystem *Filesystem
+
+	// Ignore is a gitignore string (most likely read from a file) of files to ignore
+	// from the archive.
+	Ignore string
+
+	// BaseDirectory .
+	BaseDirectory string
+
+	// Files specifies the files to archive, this takes priority over the Ignore
+	// option, if unspecified, all files in the BaseDirectory will be archived
+	// unless Ignore is set.
+	Files []string
+
+	// Progress wraps the writer of the archive to pass through the progress tracker.
+	Progress *progress.Progress
+
+	w *TarProgress
+}
+
+// Create creates an archive at dst with all the files defined in the
+// included Files array.
+//
+// THIS IS UNSAFE TO USE IF `dst` IS PROVIDED BY A USER! ONLY USE THIS WITH
+// CONTROLLED PATHS!
+func (a *Archive) Create(ctx context.Context, dst string) error {
+	// Using os.OpenFile here is expected, as long as `dst` is not a user
+	// provided path.
+	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Select a writer based off of the WriteLimit configuration option. If there is no
+	// write limit, use the file as the writer.
+	var writer io.Writer
+	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
+		// Token bucket with a capacity of "writeLimit" MiB, adding "writeLimit" MiB/s
+		// and then wrap the file writer with the token bucket limiter.
+		writer = ratelimit.Writer(f, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
+	} else {
+		writer = f
 	}
 
-	ba.BaseDirectory = strings.TrimPrefix(ba.BaseDirectory, "/")
+	return a.Stream(ctx, writer)
+}
 
-	if filesLen := len(ba.Files); filesLen > 0 {
+type walkFunc func(dirfd int, name, relative string, d ufs.DirEntry) error
+
+// Stream streams the creation of the archive to the given writer.
+func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
+	if a.Filesystem == nil {
+		return errors.New("filesystem: archive.Filesystem is unset")
+	}
+
+	// The base directory may come with a prefixed `/`, strip it to prevent
+	// problems.
+	a.BaseDirectory = strings.TrimPrefix(a.BaseDirectory, "/")
+
+	if filesLen := len(a.Files); filesLen > 0 {
 		files := make([]string, filesLen)
-		for i, f := range ba.Files {
-			if !strings.HasPrefix(f, ba.Filesystem.Path()) {
+		for i, f := range a.Files {
+			if !strings.HasPrefix(f, a.Filesystem.Path()) {
 				files[i] = f
 				continue
 			}
-			files[i] = strings.TrimPrefix(strings.TrimPrefix(f, ba.Filesystem.Path()), "/")
+			files[i] = strings.TrimPrefix(strings.TrimPrefix(f, a.Filesystem.Path()), "/")
 		}
-		ba.Files = files
+		a.Files = files
 	}
 
-	// Choose compression method for ZIP
-	var compressionMethod uint16
+	// Choose which compression level to use based on the compression_level configuration option
+	var compressionLevel int
 	switch config.Get().System.Backups.CompressionLevel {
 	case "none":
-		compressionMethod = zip.Store
+		compressionLevel = pgzip.NoCompression
 	case "best_compression":
-		compressionMethod = zip.Deflate
+		compressionLevel = pgzip.BestCompression
 	default:
-		compressionMethod = zip.Deflate
+		compressionLevel = pgzip.BestSpeed
 	}
 
-	// Create ZIP writer
-	zw := zip.NewWriter(w)
-	defer zw.Close()
+	// Create a new gzip writer around the file.
+	gw, _ := pgzip.NewWriterLevel(w, compressionLevel)
+	_ = gw.SetConcurrency(1<<20, 1)
+	defer gw.Close()
 
-	// Handle file filtering logic
-	var shouldInclude func(relative string) bool
-	if len(ba.Files) == 0 && len(ba.Ignore) > 0 {
-		// Simple ignore pattern matching - can be enhanced with proper gitignore parsing
-		shouldInclude = func(relative string) bool {
-			ignoreLines := strings.Split(ba.Ignore, "\n")
-			for _, line := range ignoreLines {
-				line = strings.TrimSpace(line)
-				if line == "" || strings.HasPrefix(line, "#") {
-					continue
-				}
-				// Simple pattern matching - you may want to use filepath.Match or a gitignore library
-				if matched, _ := filepath.Match(line, relative); matched {
-					return false
-				}
-				if strings.Contains(relative, line) {
-					return false
-				}
+	// Create a new tar writer around the gzip writer.
+	tw := tar.NewWriter(gw)
+	defer tw.Close()
+
+	a.w = NewTarProgress(tw, a.Progress)
+
+	fs := a.Filesystem.unixFS
+
+	// If we're specifically looking for only certain files, or have requested
+	// that certain files be ignored we'll update the callback function to reflect
+	// that request.
+	var callback walkFunc
+	if len(a.Files) == 0 && len(a.Ignore) > 0 {
+		i := ignore.CompileIgnoreLines(strings.Split(a.Ignore, "\n")...)
+		callback = a.callback(func(_ int, _, relative string, _ ufs.DirEntry) error {
+			if i.MatchesPath(relative) {
+				return SkipThis
 			}
-			return true
-		}
-	} else if len(ba.Files) > 0 {
-		fileSet := make(map[string]bool)
-		for _, f := range ba.Files {
-			fileSet[f] = true
-		}
-		shouldInclude = func(relative string) bool {
-			return fileSet[relative]
-		}
+			return nil
+		})
+	} else if len(a.Files) > 0 {
+		callback = a.withFilesCallback()
 	} else {
-		shouldInclude = func(relative string) bool { return true }
+		callback = a.callback()
 	}
 
-	// Walk the directory and add files to ZIP using recursive ReadDir
-	return ba.walkDirectory(ctx, zw, ba.BaseDirectory, "", shouldInclude, compressionMethod)
-}
-
-// walkDirectory recursively walks directories and adds files to the ZIP
-func (ba *BackupArchive) walkDirectory(ctx context.Context, zw *zip.Writer, currentDir, relativePath string, shouldInclude func(string) bool, compressionMethod uint16) error {
-	entries, err := ba.Filesystem.ReadDir(currentDir)
+	// Open the base directory we were provided.
+	dirfd, name, closeFd, err := fs.SafePath(a.BaseDirectory)
+	defer closeFd()
 	if err != nil {
 		return err
 	}
 
-	for _, entry := range entries {
+	// Recursively walk the base directory.
+	return fs.WalkDirat(dirfd, name, func(dirfd int, name, relative string, d ufs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+			return callback(dirfd, name, relative, d)
 		}
+	})
+}
 
-		entryName := entry.Name()
-		var fullPath, relativeName string
-
-		if currentDir == "" || currentDir == "." {
-			fullPath = entryName
-		} else {
-			fullPath = filepath.Join(currentDir, entryName)
-		}
-
-		if relativePath == "" {
-			relativeName = entryName
-		} else {
-			relativeName = filepath.Join(relativePath, entryName)
-		}
-
-		if !shouldInclude(relativeName) {
-			if entry.IsDir() {
-				continue // Skip entire directory
-			}
-			continue // Skip file
-		}
-
-		if err := ba.addEntryToZip(ctx, zw, fullPath, relativeName, entry, compressionMethod); err != nil {
-			return err
-		}
-
-		// If it's a directory, recurse into it
-		if entry.IsDir() {
-			if err := ba.walkDirectory(ctx, zw, fullPath, relativeName, shouldInclude, compressionMethod); err != nil {
+// Callback function used to determine if a given file should be included in the archive
+// being generated.
+func (a *Archive) callback(opts ...walkFunc) walkFunc {
+	return func(dirfd int, name, relative string, d ufs.DirEntry) error {
+		for _, opt := range opts {
+			if err := opt(dirfd, name, relative, d); err != nil {
 				return err
 			}
 		}
-	}
 
-	return nil
+		return a.addToArchive(dirfd, name, relative, d)
+	}
 }
 
-// addEntryToZip adds a single entry to the ZIP archive
-func (ba *BackupArchive) addEntryToZip(ctx context.Context, zw *zip.Writer, fullPath, relativeName string, entry ufs.DirEntry, compressionMethod uint16) error {
-	info, err := entry.Info()
+// addToArchive adds a given file or directory to the archive being created.
+func (a *Archive) addToArchive(dirfd int, name, relative string, d ufs.DirEntry) error {
+	s, err := d.Info()
 	if err != nil {
 		return err
 	}
 
-	// Skip sockets (ZIP doesn't support them well)
-	if info.Mode()&fs.ModeSocket != 0 {
+	// Error will come from tar#FileInfoHeader: "archive/tar: sockets not supported"
+	if s.Mode()&fs.ModeSocket != 0 {
 		return nil
 	}
 
-	// Create ZIP file header
-	header, err := zip.FileInfoHeader(info)
-	if err != nil {
-		return err
-	}
-
-	header.Name = relativeName
-	header.Method = compressionMethod
-
-	// Handle symlinks by storing the target in the comment field
-	if info.Mode()&fs.ModeSymlink != 0 {
-		target, err := os.Readlink(filepath.Join(ba.Filesystem.Path(), fullPath))
-		if err == nil {
-			header.Comment = target
+	// Resolve the symlink target if the file is a symlink.
+	var target string
+	if s.Mode()&fs.ModeSymlink != 0 {
+		// Read the target of the symlink. If there are any errors we will dump them out to
+		// the logs, but we're not going to stop the backup. There are far too many cases of
+		// symlinks causing all sorts of unnecessary pain in this process. Sucks to suck if
+		// it doesn't work.
+		target, err = os.Readlink(s.Name())
+		if err != nil {
+			// Ignore the not exist errors specifically, since there is nothing important about that.
+			if !os.IsNotExist(err) {
+				log.WithField("name", name).WithField("readlink_err", err.Error()).Warn("failed reading symlink for target path; skipping...")
+			}
+			return nil
 		}
 	}
 
-	// Create the file in the ZIP
-	fw, err := zw.CreateHeader(header)
+	// Get the tar FileInfoHeader in order to add the file to the archive.
+	header, err := tar.FileInfoHeader(s, filepath.ToSlash(target))
 	if err != nil {
-		return err
+		return errors.WrapIff(err, "failed to get tar#FileInfoHeader for '%s'", name)
 	}
 
-	// For directories and symlinks, no content to write
-	if info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
+	// Fix the header name if the file is not a symlink.
+	if s.Mode()&fs.ModeSymlink == 0 {
+		header.Name = relative
+	}
+
+	// Write the tar FileInfoHeader to the archive.
+	if err := a.w.WriteHeader(header); err != nil {
+		return errors.WrapIff(err, "failed to write tar#FileInfoHeader for '%s'", name)
+	}
+
+	// If the size of the file is less than 1 (most likely for symlinks), skip writing the file.
+	if header.Size < 1 {
 		return nil
 	}
 
-	// Open and copy file content using the filesystem's public methods
-	file, _, err := ba.Filesystem.File(fullPath)
+	// If the buffer size is larger than the file size, create a smaller buffer to hold the file.
+	var buf []byte
+	if header.Size < memory {
+		buf = make([]byte, header.Size)
+	} else {
+		// Get a fixed-size buffer from the pool to save on allocations.
+		buf = pool.Get().([]byte)
+		defer func() {
+			buf = make([]byte, memory)
+			pool.Put(buf)
+		}()
+	}
+
+	// Open the file.
+	f, err := a.Filesystem.unixFS.OpenFileat(dirfd, name, ufs.O_RDONLY, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+		return errors.WrapIff(err, "failed to open '%s' for copying", header.Name)
 	}
-	defer file.Close()
+	defer f.Close()
 
-	written, err := io.Copy(fw, file)
-	if err != nil {
-		return err
+	// Copy the file's contents to the archive using our buffer.
+	if _, err := io.CopyBuffer(a.w, io.LimitReader(f, header.Size), buf); err != nil {
+		return errors.WrapIff(err, "failed to copy '%s' to archive", header.Name)
 	}
-
-	// Update progress if available
-	if ba.Progress != nil {
-		atomic.AddInt64(ba.Progress, written)
-	}
-
 	return nil
+}
+
+// withFilesCallback returns a callback function that only includes files that are
+// specified in the Files slice for the archive.
+func (a *Archive) withFilesCallback() walkFunc {
+	return a.callback(func(_ int, _, relative string, d ufs.DirEntry) error {
+		for _, f := range a.Files {
+			// Check if the current file or directory is in the list of files to archive.
+			if f == relative {
+				return nil
+			}
+
+			// Check if the current file or directory is a parent of any file in the list.
+			if strings.HasPrefix(f, relative+"/") {
+				return nil
+			}
+
+			// Check if the current file or directory is a child of any file in the list.
+			if strings.HasPrefix(relative, f+"/") || f == "." {
+				return nil
+			}
+		}
+
+		if d.IsDir() {
+			return SkipThis
+		}
+
+		return SkipThis
+	})
 }

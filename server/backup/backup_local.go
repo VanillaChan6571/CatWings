@@ -60,8 +60,8 @@ func (b *LocalBackup) WithLogContext(c map[string]interface{}) {
 // Generate generates a backup of the selected files and pushes it to the
 // defined location for this instance.
 func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
-	// Use our new ZIP-based BackupArchive instead of filesystem.Archive
-	ba := &BackupArchive{
+	// Use our new ZIP-based BackupArchive from filesystem package (NOT the tar-based Archive)
+	ba := &filesystem.BackupArchive{
 		BaseDirectory: "/",
 		Ignore:        ignore,
 		Filesystem:    fsys,

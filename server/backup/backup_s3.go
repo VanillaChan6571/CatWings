@@ -51,7 +51,7 @@ func (s *S3Backup) WithLogContext(c map[string]interface{}) {
 func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
 	defer s.Remove()
 
-	// Use our new ZIP-based BackupArchive from filesystem package
+	// Use our new ZIP-based BackupArchive from filesystem package (NOT the tar-based Archive)
 	ba := &filesystem.BackupArchive{
 		BaseDirectory: "/",
 		Ignore:        ignore,

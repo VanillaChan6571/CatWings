@@ -29,7 +29,7 @@ import (
 // and the compressed file will be placed at that location named
 // `archive-{date}.zip`.
 func (fs *Filesystem) CompressFiles(dir string, paths []string) (ufs.FileInfo, error) {
-	// Use our new ZIP-based BackupArchive
+	// Use our new ZIP-based BackupArchive (NOT the tar-based Archive)
 	ba := &BackupArchive{
 		Filesystem:    fs,
 		BaseDirectory: dir,

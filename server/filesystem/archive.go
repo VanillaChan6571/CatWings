@@ -240,15 +240,15 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 
 // addToArchive adds a file to the archive using safe path-based operations
 func (a *Archive) addToArchive(fullPath, relative string, d ufs.DirEntry) error {
-	// FIXED: Handle bad file descriptor errors gracefully
-	s, err := d.Info()
+	// FIXED: Get file info directly from filesystem path instead of using DirEntry.Info()
+	// This avoids the "bad file descriptor" issue with the DirEntry
+	absolutePath := filepath.Join(a.Filesystem.Path(), fullPath)
+	s, err := os.Lstat(absolutePath)
 	if err != nil {
-		// If we get a bad file descriptor error, log it and skip the file
-		if strings.Contains(err.Error(), "bad file descriptor") {
-			log.WithField("path", fullPath).WithField("error", err.Error()).Warn("skipping file due to bad file descriptor")
+		if os.IsNotExist(err) {
 			return nil
 		}
-		return err
+		return errors.WrapIff(err, "failed to get file info for '%s'", fullPath)
 	}
 
 	// Error will come from tar#FileInfoHeader: "archive/tar: sockets not supported"

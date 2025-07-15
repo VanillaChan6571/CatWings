@@ -179,24 +179,19 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 		default:
 		}
 
-		// Calculate relative path for the archive
-		var relative string
-		if path == baseDir || path == "." {
-			relative = "."
-		} else if baseDir == "." {
-			relative = path
-		} else {
-			// Remove the base directory prefix to get relative path
-			if strings.HasPrefix(path, baseDir+"/") {
-				relative = strings.TrimPrefix(path, baseDir+"/")
-			} else if path == baseDir {
-				relative = "."
-			} else {
-				relative = path
+		// Calculate relative path for the archive - simplified logic
+		relative := path
+
+		// If we have a base directory, strip it from the relative path
+		// This matches the legacy behavior
+		if baseDir != "." {
+			baseName := filepath.Base(baseDir)
+			if strings.HasPrefix(relative, baseName+"/") {
+				relative = strings.TrimPrefix(relative, baseName+"/")
 			}
 		}
 
-		// Apply file filtering logic - skip files/directories that shouldn't be included
+		// Apply file filtering logic - use legacy-style filtering
 		if len(a.Files) == 0 && len(a.Ignore) > 0 {
 			// Use ignore patterns
 			if ignoreMatcher != nil && ignoreMatcher.MatchesPath(relative) {
@@ -206,27 +201,17 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 				return nil
 			}
 		} else if len(a.Files) > 0 {
-			// Use specific file list
+			// Use specific file list - match legacy behavior
 			found := false
 			for _, f := range a.Files {
-				// Check if the current file or directory is in the list of files to archive.
-				if f == relative {
-					found = true
-					break
-				}
-				// Check if the current file or directory is a parent of any file in the list.
-				if strings.HasPrefix(f, relative+"/") {
-					found = true
-					break
-				}
-				// Check if the current file or directory is a child of any file in the list.
-				if strings.HasPrefix(relative, f+"/") || f == "." {
+				// Allow exact file matches, otherwise check if file is within a parent directory.
+				// The slashes are added in the prefix checks to prevent partial name matches.
+				if f == relative || strings.HasPrefix(strings.TrimSuffix(relative, "/")+"/", strings.TrimSuffix(f, "/")+"/") {
 					found = true
 					break
 				}
 			}
 			if !found {
-				// Skip this file/directory and its contents if it's a directory
 				if d.IsDir() {
 					return filepath.SkipDir
 				}
@@ -240,6 +225,12 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 
 // addToArchive adds a file to the archive using safe path-based operations
 func (a *Archive) addToArchive(fullPath, relative string, d ufs.DirEntry) error {
+	// Skip directories because we are walking them recursively.
+	// Only files need to be added to the archive.
+	if d.IsDir() {
+		return nil
+	}
+
 	// FIXED: Get file info directly from filesystem path instead of using DirEntry.Info()
 	// This avoids the "bad file descriptor" issue with the DirEntry
 	absolutePath := filepath.Join(a.Filesystem.Path(), fullPath)

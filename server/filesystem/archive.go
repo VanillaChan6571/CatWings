@@ -155,18 +155,14 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 
 	fs := a.Filesystem.unixFS
 
-	// FIXED: Use WalkDir instead of WalkDirat to avoid file descriptor management issues
-	// WalkDir is simpler and doesn't have the complex dirfd lifecycle problems
+	// Use WalkDir to walk the filesystem
 	baseDir := a.BaseDirectory
 	if baseDir == "" {
 		baseDir = "."
 	}
 
-	// Prepare ignore matcher if needed
-	var ignoreMatcher *ignore.GitIgnore
-	if len(a.Files) == 0 && len(a.Ignore) > 0 {
-		ignoreMatcher = ignore.CompileIgnoreLines(strings.Split(a.Ignore, "\n")...)
-	}
+	// Create a callback function like the legacy version
+	callback := a.createCallback()
 
 	return fs.WalkDir(baseDir, func(path string, d ufs.DirEntry, err error) error {
 		if err != nil {
@@ -179,115 +175,122 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 		default:
 		}
 
-		// Calculate relative path for the archive - simplified logic
+		// Calculate relative path - use the path directly since we're walking from root
 		relative := path
 
-		// If we have a base directory, strip it from the relative path
-		// This matches the legacy behavior
-		if baseDir != "." {
-			baseName := filepath.Base(baseDir)
-			if strings.HasPrefix(relative, baseName+"/") {
-				relative = strings.TrimPrefix(relative, baseName+"/")
-			}
+		// Skip the root directory itself
+		if relative == "." {
+			return nil
 		}
 
-		// Apply file filtering logic - use legacy-style filtering
-		if len(a.Files) == 0 && len(a.Ignore) > 0 {
-			// Use ignore patterns
-			if ignoreMatcher != nil && ignoreMatcher.MatchesPath(relative) {
-				if d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-		} else if len(a.Files) > 0 {
-			// Use specific file list - match legacy behavior
-			found := false
-			for _, f := range a.Files {
-				// Allow exact file matches, otherwise check if file is within a parent directory.
-				// The slashes are added in the prefix checks to prevent partial name matches.
-				if f == relative || strings.HasPrefix(strings.TrimSuffix(relative, "/")+"/", strings.TrimSuffix(f, "/")+"/") {
-					found = true
-					break
-				}
-			}
-			if !found {
-				if d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-		}
-
-		return a.addToArchive(path, relative, d)
+		return callback(relative, d)
 	})
 }
 
-// addToArchive adds a file to the archive using safe path-based operations
-func (a *Archive) addToArchive(fullPath, relative string, d ufs.DirEntry) error {
-	// Skip directories because we are walking them recursively.
-	// Only files need to be added to the archive.
-	if d.IsDir() {
-		return nil
+// createCallback creates a callback function similar to the legacy version
+func (a *Archive) createCallback() func(relative string, d ufs.DirEntry) error {
+	// Create the appropriate filter function
+	var shouldInclude func(relative string) bool
+
+	if len(a.Files) == 0 && len(a.Ignore) > 0 {
+		// Use ignore patterns
+		ignoreMatcher := ignore.CompileIgnoreLines(strings.Split(a.Ignore, "\n")...)
+		shouldInclude = func(relative string) bool {
+			return !ignoreMatcher.MatchesPath(relative)
+		}
+	} else if len(a.Files) > 0 {
+		// Use specific file list - exactly like legacy
+		shouldInclude = func(relative string) bool {
+			for _, f := range a.Files {
+				// Exact match or file is within the directory
+				if f == relative || strings.HasPrefix(strings.TrimSuffix(relative, "/")+"/", strings.TrimSuffix(f, "/")+"/") {
+					return true
+				}
+			}
+			return false
+		}
+	} else {
+		// Include everything
+		shouldInclude = func(relative string) bool {
+			return true
+		}
 	}
 
-	// FIXED: Get file info directly from filesystem path instead of using DirEntry.Info()
-	// This avoids the "bad file descriptor" issue with the DirEntry
-	absolutePath := filepath.Join(a.Filesystem.Path(), fullPath)
+	return func(relative string, d ufs.DirEntry) error {
+		// Skip directories - they are walked recursively but not added to archive
+		if d.IsDir() {
+			// Check if we should skip this directory entirely
+			if !shouldInclude(relative) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// For files, check if they should be included
+		if !shouldInclude(relative) {
+			return nil
+		}
+
+		// Add the file to the archive
+		return a.addToArchive(relative, d)
+	}
+}
+
+// addToArchive adds a file to the archive
+func (a *Archive) addToArchive(relative string, d ufs.DirEntry) error {
+	// Get file info directly from the filesystem path
+	absolutePath := filepath.Join(a.Filesystem.Path(), relative)
 	s, err := os.Lstat(absolutePath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return errors.WrapIff(err, "failed to get file info for '%s'", fullPath)
+		return errors.WrapIff(err, "failed to get file info for '%s'", relative)
 	}
 
-	// Error will come from tar#FileInfoHeader: "archive/tar: sockets not supported"
+	// Skip socket files as they are unsupported by archive/tar
 	if s.Mode()&fs.ModeSocket != 0 {
 		return nil
 	}
 
-	// Resolve the symlink target if the file is a symlink.
+	// Handle symlinks
 	var target string
 	if s.Mode()&fs.ModeSymlink != 0 {
-		// Use the full filesystem path for reading symlinks
-		absolutePath := filepath.Join(a.Filesystem.Path(), fullPath)
 		target, err = os.Readlink(absolutePath)
 		if err != nil {
 			if !os.IsNotExist(err) {
-				log.WithField("path", fullPath).WithField("readlink_err", err.Error()).Warn("failed reading symlink for target path; skipping...")
+				log.WithField("path", relative).WithField("readlink_err", err.Error()).Warn("failed reading symlink for target path; skipping...")
 			}
 			return nil
 		}
 	}
 
-	// Get the tar FileInfoHeader in order to add the file to the archive.
+	// Create tar header
 	header, err := tar.FileInfoHeader(s, filepath.ToSlash(target))
 	if err != nil {
-		return errors.WrapIff(err, "failed to get tar#FileInfoHeader for '%s'", fullPath)
+		return errors.WrapIff(err, "failed to get tar#FileInfoHeader for '%s'", relative)
 	}
 
-	// Fix the header name if the file is not a symlink.
+	// Set the header name to the relative path
 	if s.Mode()&fs.ModeSymlink == 0 {
 		header.Name = relative
 	}
 
-	// Write the tar FileInfoHeader to the archive.
+	// Write the header
 	if err := a.w.WriteHeader(header); err != nil {
-		return errors.WrapIff(err, "failed to write tar#FileInfoHeader for '%s'", fullPath)
+		return errors.WrapIff(err, "failed to write tar#FileInfoHeader for '%s'", relative)
 	}
 
-	// If the size of the file is less than 1 (most likely for symlinks), skip writing the file.
+	// Skip if no content to write
 	if header.Size < 1 {
 		return nil
 	}
 
-	// If the buffer size is larger than the file size, create a smaller buffer to hold the file.
+	// Prepare buffer
 	var buf []byte
 	if header.Size < memory {
 		buf = make([]byte, header.Size)
 	} else {
-		// Get a fixed-size buffer from the pool to save on allocations.
 		buf = pool.Get().([]byte)
 		defer func() {
 			buf = make([]byte, memory)
@@ -295,8 +298,8 @@ func (a *Archive) addToArchive(fullPath, relative string, d ufs.DirEntry) error 
 		}()
 	}
 
-	// Open the file using path-based operation instead of dirfd-based
-	f, err := a.Filesystem.unixFS.Open(fullPath)
+	// Open and copy file content
+	f, err := a.Filesystem.unixFS.Open(relative)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -305,9 +308,10 @@ func (a *Archive) addToArchive(fullPath, relative string, d ufs.DirEntry) error 
 	}
 	defer f.Close()
 
-	// Copy the file's contents to the archive using our buffer.
+	// Copy file contents to archive
 	if _, err := io.CopyBuffer(a.w, io.LimitReader(f, header.Size), buf); err != nil {
 		return errors.WrapIff(err, "failed to copy '%s' to archive", header.Name)
 	}
+
 	return nil
 }

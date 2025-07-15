@@ -196,11 +196,14 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 			}
 		}
 
-		// Apply file filtering logic - FIXED: Return nil instead of SkipThis
+		// Apply file filtering logic - skip files/directories that shouldn't be included
 		if len(a.Files) == 0 && len(a.Ignore) > 0 {
 			// Use ignore patterns
 			if ignoreMatcher != nil && ignoreMatcher.MatchesPath(relative) {
-				return nil // ← FIXED: Return nil instead of SkipThis
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
 			}
 		} else if len(a.Files) > 0 {
 			// Use specific file list
@@ -223,7 +226,10 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 				}
 			}
 			if !found {
-				// FIXED: Return nil instead of SkipThis to avoid bubbling up as an error
+				// Skip this file/directory and its contents if it's a directory
+				if d.IsDir() {
+					return filepath.SkipDir
+				}
 				return nil
 			}
 		}
@@ -234,8 +240,14 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 
 // addToArchive adds a file to the archive using safe path-based operations
 func (a *Archive) addToArchive(fullPath, relative string, d ufs.DirEntry) error {
+	// FIXED: Handle bad file descriptor errors gracefully
 	s, err := d.Info()
 	if err != nil {
+		// If we get a bad file descriptor error, log it and skip the file
+		if strings.Contains(err.Error(), "bad file descriptor") {
+			log.WithField("path", fullPath).WithField("error", err.Error()).Warn("skipping file due to bad file descriptor")
+			return nil
+		}
 		return err
 	}
 

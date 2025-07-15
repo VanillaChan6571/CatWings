@@ -177,13 +177,14 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 
 	// Open the base directory we were provided.
 	dirfd, name, closeFd, err := fs.SafePath(a.BaseDirectory)
-	defer closeFd()
 	if err != nil {
 		return err
 	}
+	// FIXED: Don't defer closeFd() here - let WalkDirat finish first
+	// The original code was closing the dirfd while WalkDirat was still using it
 
 	// Recursively walk the base directory.
-	return fs.WalkDirat(dirfd, name, func(dirfd int, name, relative string, d ufs.DirEntry, err error) error {
+	walkErr := fs.WalkDirat(dirfd, name, func(dirfd int, name, relative string, d ufs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -194,6 +195,11 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 			return callback(dirfd, name, relative, d)
 		}
 	})
+
+	// Now it's safe to close the file descriptor
+	closeFd()
+
+	return walkErr
 }
 
 // Callback function used to determine if a given file should be included in the archive

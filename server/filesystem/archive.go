@@ -196,11 +196,11 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 			}
 		}
 
-		// Apply file filtering logic
+		// Apply file filtering logic - FIXED: Return nil instead of SkipThis
 		if len(a.Files) == 0 && len(a.Ignore) > 0 {
 			// Use ignore patterns
 			if ignoreMatcher != nil && ignoreMatcher.MatchesPath(relative) {
-				return SkipThis
+				return nil // ← FIXED: Return nil instead of SkipThis
 			}
 		} else if len(a.Files) > 0 {
 			// Use specific file list
@@ -223,10 +223,8 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 				}
 			}
 			if !found {
-				if d.IsDir() {
-					return SkipThis
-				}
-				return SkipThis
+				// FIXED: Return nil instead of SkipThis to avoid bubbling up as an error
+				return nil
 			}
 		}
 

@@ -299,7 +299,7 @@ func (a *Archive) addToArchive(relative string, d ufs.DirEntry) error {
 	}
 
 	// Open and copy file content
-	f, err := a.Filesystem.unixFS.Open(relative)
+	f, err := os.Open(filepath.Join(a.Filesystem.Path(), relative))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -308,7 +308,6 @@ func (a *Archive) addToArchive(relative string, d ufs.DirEntry) error {
 	}
 	defer f.Close()
 
-	// Copy file contents to archive
 	if _, err := io.CopyBuffer(a.w, io.LimitReader(f, header.Size), buf); err != nil {
 		return errors.WrapIff(err, "failed to copy '%s' to archive", header.Name)
 	}

@@ -356,8 +356,12 @@ func (ba *BackupArchive) walkDirectory(ctx context.Context, zw *zip.Writer, curr
 
 // addEntryToZip adds a single entry to the ZIP archive
 func (ba *BackupArchive) addEntryToZip(ctx context.Context, zw *zip.Writer, fullPath, relativeName string, entry ufs.DirEntry, compressionMethod uint16) error {
-	info, err := entry.Info()
+	abs := filepath.Join(ba.Filesystem.Path(), fullPath)
+	info, err := os.Lstat(abs)
 	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
 		return err
 	}
 
@@ -377,7 +381,7 @@ func (ba *BackupArchive) addEntryToZip(ctx context.Context, zw *zip.Writer, full
 
 	// Handle symlinks by storing the target in the comment field
 	if info.Mode()&fs.ModeSymlink != 0 {
-		target, err := os.Readlink(filepath.Join(ba.Filesystem.Path(), fullPath))
+		target, err := os.Readlink(abs)
 		if err == nil {
 			header.Comment = target
 		}

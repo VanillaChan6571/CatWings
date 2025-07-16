@@ -148,7 +148,6 @@ func (ba *BackupArchive) walkDirectory(ctx context.Context, zw *zip.Writer, curr
 	return nil
 }
 
-// addEntryToZip adds a single entry to the ZIP archive
 func (ba *BackupArchive) addEntryToZip(ctx context.Context, zw *zip.Writer, fullPath, relativeName string, entry ufs.DirEntry, compressionMethod uint16) error {
 	abs := filepath.Join(ba.Filesystem.Path(), fullPath)
 	info, err := os.Lstat(abs)
@@ -159,17 +158,15 @@ func (ba *BackupArchive) addEntryToZip(ctx context.Context, zw *zip.Writer, full
 		return err
 	}
 
-	// Skip sockets (ZIP doesn't support them well)
-	if info.Mode()&fs.ModeSocket != 0 {
+	// Skip creating a file entry for directories; just recurse
+	if info.IsDir() {
 		return nil
 	}
 
-	// Create ZIP file header
 	header, err := zip.FileInfoHeader(info)
 	if err != nil {
 		return err
 	}
-
 	header.Name = relativeName
 	header.Method = compressionMethod
 
@@ -181,19 +178,18 @@ func (ba *BackupArchive) addEntryToZip(ctx context.Context, zw *zip.Writer, full
 		}
 	}
 
-	// Create the file in the ZIP
 	fw, err := zw.CreateHeader(header)
 	if err != nil {
 		return err
 	}
 
-	// For directories and symlinks, no content to write
-	if info.IsDir() || info.Mode()&fs.ModeSymlink != 0 {
+	// For symlinks, no content to write
+	if info.Mode()&fs.ModeSymlink != 0 {
 		return nil
 	}
 
-	// Open and copy file content using the filesystem's public methods
-	file, _, err := ba.Filesystem.File(fullPath)
+	// Copy file contents
+	file, err := os.Open(abs)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -207,7 +203,7 @@ func (ba *BackupArchive) addEntryToZip(ctx context.Context, zw *zip.Writer, full
 		return err
 	}
 
-	// Update progress if available
+	// Progress tracking if used
 	if ba.Progress != nil {
 		atomic.AddInt64(ba.Progress, written)
 	}

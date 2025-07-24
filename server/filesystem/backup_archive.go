@@ -82,12 +82,18 @@ func (ba *BackupArchive) Stream(ctx context.Context, w io.Writer) error {
 			return true
 		}
 	} else if len(ba.Files) > 0 {
-		fileSet := make(map[string]bool)
-		for _, f := range ba.Files {
-			fileSet[f] = true
-		}
 		shouldInclude = func(relative string) bool {
-			return fileSet[relative]
+			for _, selectedPath := range ba.Files {
+				// Exact match for files or folders
+				if relative == selectedPath {
+					return true
+				}
+				// Check if this file/folder is inside a selected folder
+				if strings.HasPrefix(relative, selectedPath+"/") {
+					return true
+				}
+			}
+			return false
 		}
 	} else {
 		shouldInclude = func(relative string) bool { return true }

@@ -668,12 +668,6 @@ func ConfigureDirectories() error {
 	if err := os.MkdirAll(_config.System.BackupDirectory, 0o700); err != nil {
 		return err
 	}
-	if _config.System.MachineID.Enable {
-		log.WithField("path", _config.System.MachineID.Directory).Debug("ensuring machine-id directory exists")
-		if err := os.MkdirAll(_config.System.MachineID.Directory, 0o755); err != nil {
-			return err
-		}
-	}
 	if _config.System.Passwd.Enable {
 		passwdDir, err := validatedDirectoryPath(_config.System.Passwd.Directory)
 		if err != nil {

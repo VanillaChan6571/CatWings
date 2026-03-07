@@ -120,7 +120,8 @@ type postUpdateConfigurationResponse struct {
 
 // Updates the running configuration for this Wings instance.
 func postUpdateConfiguration(c *gin.Context) {
-	cfg := config.Get()
+	current := config.Get()
+	cfg := *current
 
 	if cfg.IgnorePanelConfigUpdates {
 		c.JSON(http.StatusOK, postUpdateConfigurationResponse{
@@ -133,25 +134,35 @@ func postUpdateConfiguration(c *gin.Context) {
 		return
 	}
 
+	// Preserve local filesystem paths from existing daemon config.
+	cfg.System.RootDirectory = current.System.RootDirectory
+	cfg.System.LogDirectory = current.System.LogDirectory
+	cfg.System.Data = current.System.Data
+	cfg.System.ArchiveDirectory = current.System.ArchiveDirectory
+	cfg.System.BackupDirectory = current.System.BackupDirectory
+	cfg.System.TmpDirectory = current.System.TmpDirectory
+	cfg.System.Passwd.Directory = current.System.Passwd.Directory
+	cfg.System.MachineID.Directory = current.System.MachineID.Directory
+
 	// Keep the SSL certificates the same since the Panel will send through Lets Encrypt
 	// default locations. However, if we picked a different location manually we don't
 	// want to override that.
 	//
 	// If you pass through manual locations in the API call this logic will be skipped.
 	if strings.HasPrefix(cfg.Api.Ssl.KeyFile, "/etc/letsencrypt/live/") {
-		cfg.Api.Ssl.KeyFile = config.Get().Api.Ssl.KeyFile
-		cfg.Api.Ssl.CertificateFile = config.Get().Api.Ssl.CertificateFile
+		cfg.Api.Ssl.KeyFile = current.Api.Ssl.KeyFile
+		cfg.Api.Ssl.CertificateFile = current.Api.Ssl.CertificateFile
 	}
 
 	// Try to write this new configuration to the disk before updating our global
 	// state with it.
-	if err := config.WriteToDisk(cfg); err != nil {
+	if err := config.WriteToDisk(&cfg); err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
 	// Since we wrote it to the disk successfully now update the global configuration
 	// state to use this new configuration struct.
-	config.Set(cfg)
+	config.Set(&cfg)
 	c.JSON(http.StatusOK, postUpdateConfigurationResponse{
 		Applied: true,
 	})

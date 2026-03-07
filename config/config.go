@@ -388,7 +388,6 @@ func NewAtPath(path string) (*Configuration, error) {
 	// Track the location where we created this configuration.
 	c.path = path
 	return &c, nil
-	return err
 }
 
 // Set the global configuration instance. This is a blocking operation such that

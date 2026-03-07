@@ -675,6 +675,12 @@ func ConfigureDirectories() error {
 		}
 	}
 	if _config.System.Passwd.Enable {
+		passwdDir, err := validatedDirectoryPath(_config.System.Passwd.Directory)
+		if err != nil {
+			return err
+		}
+
+		_config.System.Passwd.Directory = passwdDir
 		log.WithField("path", _config.System.Passwd.Directory).Debug("ensuring passwd directory exists")
 		if err := os.MkdirAll(_config.System.Passwd.Directory, 0o755); err != nil {
 			return err
@@ -682,6 +688,12 @@ func ConfigureDirectories() error {
 	}
 
 	if _config.System.MachineID.Enable {
+		machineIDDir, err := validatedDirectoryPath(_config.System.MachineID.Directory)
+		if err != nil {
+			return err
+		}
+
+		_config.System.MachineID.Directory = machineIDDir
 		log.WithField("path", _config.System.MachineID.Directory).Debug("ensuring machine-id directory exists")
 		if err := os.MkdirAll(_config.System.MachineID.Directory, 0o755); err != nil {
 			return err
@@ -689,6 +701,19 @@ func ConfigureDirectories() error {
 	}
 
 	return nil
+}
+
+func validatedDirectoryPath(raw string) (string, error) {
+	cleaned := filepath.Clean(strings.TrimSpace(raw))
+	if cleaned == "" || cleaned == "." {
+		return "", errors.New("config: directory path cannot be empty")
+	}
+
+	if !filepath.IsAbs(cleaned) {
+		return "", errors.New("config: directory path must be absolute")
+	}
+
+	return cleaned, nil
 }
 
 // EnableLogRotation writes a logrotate file for wings to the system logrotate

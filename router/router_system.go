@@ -118,10 +118,106 @@ type postUpdateConfigurationResponse struct {
 	Applied bool `json:"applied"`
 }
 
+// panelUpdateConfigurationPayload is a constrained request payload for /api/update.
+// It intentionally excludes local filesystem path fields.
+type panelUpdateConfigurationPayload struct {
+	Debug                 bool                                `json:"debug"`
+	AppName               string                              `json:"app_name"`
+	Uuid                  string                              `json:"uuid"`
+	AuthenticationTokenId string                              `json:"token_id"`
+	AuthenticationToken   string                              `json:"token"`
+	Api                   config.ApiConfiguration             `json:"api"`
+	Docker                config.DockerConfiguration          `json:"docker"`
+	Throttles             config.ConsoleThrottles             `json:"throttles"`
+	Remote                string                              `json:"remote"`
+	RemoteQuery           config.RemoteQueryConfiguration     `json:"remote_query"`
+	AllowedMounts         []string                            `json:"allowed_mounts"`
+	AllowedOrigins        []string                            `json:"allowed_origins"`
+	AllowCORSPrivateNet   bool                                `json:"allow_cors_private_network"`
+	IgnorePanelUpdates    bool                                `json:"ignore_panel_config_updates"`
+	System                panelUpdateSystemConfiguration      `json:"system"`
+}
+
+type panelUpdateSystemConfiguration struct {
+	Username               string                    `json:"username"`
+	Timezone               string                    `json:"timezone"`
+	User                   panelUpdateSystemUser     `json:"user"`
+	Passwd                 panelUpdateSystemPasswd   `json:"passwd"`
+	MachineID              panelUpdateSystemMachineID `json:"machine_id"`
+	DiskCheckInterval      int64                     `json:"disk_check_interval"`
+	ActivitySendInterval   int                       `json:"activity_send_interval"`
+	ActivitySendCount      int                       `json:"activity_send_count"`
+	CheckPermissionsOnBoot bool                      `json:"check_permissions_on_boot"`
+	EnableLogRotate        bool                      `json:"enable_log_rotate"`
+	WebsocketLogCount      int                       `json:"websocket_log_count"`
+	Sftp                   config.SftpConfiguration  `json:"sftp"`
+	CrashDetection         config.CrashDetection     `json:"crash_detection"`
+	Backups                config.Backups            `json:"backups"`
+	Transfers              config.Transfers          `json:"transfers"`
+	OpenatMode             string                    `json:"openat_mode"`
+}
+
+type panelUpdateSystemUser struct {
+	Rootless struct {
+		Enabled      bool `json:"enabled"`
+		ContainerUID int  `json:"container_uid"`
+		ContainerGID int  `json:"container_gid"`
+	} `json:"rootless"`
+	Uid int `json:"uid"`
+	Gid int `json:"gid"`
+}
+
+type panelUpdateSystemPasswd struct {
+	Enable bool `json:"enabled"`
+}
+
+type panelUpdateSystemMachineID struct {
+	Enable bool `json:"enabled"`
+}
+
+func applyPanelUpdateConfigurationPayload(cfg *config.Configuration, payload *panelUpdateConfigurationPayload) {
+	cfg.Debug = payload.Debug
+	cfg.AppName = payload.AppName
+	cfg.Uuid = payload.Uuid
+	cfg.AuthenticationTokenId = payload.AuthenticationTokenId
+	cfg.AuthenticationToken = payload.AuthenticationToken
+	cfg.Api = payload.Api
+	cfg.Docker = payload.Docker
+	cfg.Throttles = payload.Throttles
+	cfg.PanelLocation = payload.Remote
+	cfg.RemoteQuery = payload.RemoteQuery
+	cfg.AllowedMounts = payload.AllowedMounts
+	cfg.AllowedOrigins = payload.AllowedOrigins
+	cfg.AllowCORSPrivateNetwork = payload.AllowCORSPrivateNet
+	cfg.IgnorePanelConfigUpdates = payload.IgnorePanelUpdates
+
+	cfg.System.Username = payload.System.Username
+	cfg.System.Timezone = payload.System.Timezone
+	cfg.System.User.Rootless.Enabled = payload.System.User.Rootless.Enabled
+	cfg.System.User.Rootless.ContainerUID = payload.System.User.Rootless.ContainerUID
+	cfg.System.User.Rootless.ContainerGID = payload.System.User.Rootless.ContainerGID
+	cfg.System.User.Uid = payload.System.User.Uid
+	cfg.System.User.Gid = payload.System.User.Gid
+	cfg.System.Passwd.Enable = payload.System.Passwd.Enable
+	cfg.System.MachineID.Enable = payload.System.MachineID.Enable
+	cfg.System.DiskCheckInterval = payload.System.DiskCheckInterval
+	cfg.System.ActivitySendInterval = payload.System.ActivitySendInterval
+	cfg.System.ActivitySendCount = payload.System.ActivitySendCount
+	cfg.System.CheckPermissionsOnBoot = payload.System.CheckPermissionsOnBoot
+	cfg.System.EnableLogRotate = payload.System.EnableLogRotate
+	cfg.System.WebsocketLogCount = payload.System.WebsocketLogCount
+	cfg.System.Sftp = payload.System.Sftp
+	cfg.System.CrashDetection = payload.System.CrashDetection
+	cfg.System.Backups = payload.System.Backups
+	cfg.System.Transfers = payload.System.Transfers
+	cfg.System.OpenatMode = payload.System.OpenatMode
+}
+
 // Updates the running configuration for this Wings instance.
 func postUpdateConfiguration(c *gin.Context) {
 	current := config.Get()
 	cfg := *current
+	payload := panelUpdateConfigurationPayload{}
 
 	if cfg.IgnorePanelConfigUpdates {
 		c.JSON(http.StatusOK, postUpdateConfigurationResponse{
@@ -130,9 +226,11 @@ func postUpdateConfiguration(c *gin.Context) {
 		return
 	}
 
-	if err := c.BindJSON(&cfg); err != nil {
+	if err := c.BindJSON(&payload); err != nil {
 		return
 	}
+
+	applyPanelUpdateConfigurationPayload(&cfg, &payload)
 
 	// Preserve local filesystem paths from existing daemon config.
 	cfg.System.RootDirectory = current.System.RootDirectory

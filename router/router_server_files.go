@@ -1,7 +1,9 @@
 package router
 
 import (
+	"archive/zip"
 	"bufio"
+	"bytes"
 	"context"
 	"io"
 	"mime/multipart"
@@ -365,6 +367,60 @@ func deleteServerPullRemoteFile(c *gin.Context) {
 		dl.Cancel()
 	}
 	c.Status(http.StatusNoContent)
+}
+
+// Returns the contents of a single named entry from a zip archive on the server.
+// Query params: archive (path to zip), entry (path inside zip to read).
+func getServerZipEntry(c *gin.Context) {
+	s := middleware.ExtractServer(c)
+
+	archivePath := strings.TrimLeft(c.Query("archive"), "/")
+	entryName := c.Query("entry")
+	if archivePath == "" || entryName == "" {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "archive and entry query params are required"})
+		return
+	}
+
+	f, _, err := s.Filesystem().File(archivePath)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "archive not found"})
+		return
+	}
+	defer f.Close()
+
+	// Read the file into memory so we can use archive/zip (needs io.ReaderAt + size).
+	data, err := io.ReadAll(f)
+	if err != nil {
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": "failed to open archive: " + err.Error()})
+		return
+	}
+
+	for _, file := range r.File {
+		if file.Name != entryName {
+			continue
+		}
+		rc, err := file.Open()
+		if err != nil {
+			middleware.CaptureAndAbort(c, err)
+			return
+		}
+		defer rc.Close()
+		content, err := io.ReadAll(rc)
+		if err != nil {
+			middleware.CaptureAndAbort(c, err)
+			return
+		}
+		c.Data(http.StatusOK, "application/json; charset=utf-8", content)
+		return
+	}
+
+	c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "entry not found in archive"})
 }
 
 // Create a directory on a server.

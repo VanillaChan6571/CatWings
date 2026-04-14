@@ -3,7 +3,6 @@ package router
 import (
 	"archive/zip"
 	"bufio"
-	"bytes"
 	"context"
 	"io"
 	"mime/multipart"
@@ -381,21 +380,16 @@ func getServerZipEntry(c *gin.Context) {
 		return
 	}
 
-	f, _, err := s.Filesystem().File(archivePath)
+	f, st, err := s.Filesystem().File(archivePath)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "archive not found"})
 		return
 	}
 	defer f.Close()
 
-	// Read the file into memory so we can use archive/zip (needs io.ReaderAt + size).
-	data, err := io.ReadAll(f)
-	if err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
-
-	r, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	// Use the file handle directly as io.ReaderAt — avoids loading the entire
+	// archive into memory (zip only needs the central directory + target entry).
+	r, err := zip.NewReader(f, st.Size())
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": "failed to open archive: " + err.Error()})
 		return

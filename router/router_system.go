@@ -121,40 +121,40 @@ type postUpdateConfigurationResponse struct {
 // panelUpdateConfigurationPayload is a constrained request payload for /api/update.
 // It intentionally excludes local filesystem path fields.
 type panelUpdateConfigurationPayload struct {
-	Debug                 bool                                `json:"debug"`
-	AppName               string                              `json:"app_name"`
-	Uuid                  string                              `json:"uuid"`
-	AuthenticationTokenId string                              `json:"token_id"`
-	AuthenticationToken   string                              `json:"token"`
-	Api                   config.ApiConfiguration             `json:"api"`
-	Docker                config.DockerConfiguration          `json:"docker"`
-	Throttles             config.ConsoleThrottles             `json:"throttles"`
-	Remote                string                              `json:"remote"`
-	RemoteQuery           config.RemoteQueryConfiguration     `json:"remote_query"`
-	AllowedMounts         []string                            `json:"allowed_mounts"`
-	AllowedOrigins        []string                            `json:"allowed_origins"`
-	AllowCORSPrivateNet   bool                                `json:"allow_cors_private_network"`
-	IgnorePanelUpdates    bool                                `json:"ignore_panel_config_updates"`
-	System                panelUpdateSystemConfiguration      `json:"system"`
+	Debug                 bool                            `json:"debug"`
+	AppName               string                          `json:"app_name"`
+	Uuid                  string                          `json:"uuid"`
+	AuthenticationTokenId string                          `json:"token_id"`
+	AuthenticationToken   string                          `json:"token"`
+	Api                   config.ApiConfiguration         `json:"api"`
+	Docker                config.DockerConfiguration      `json:"docker"`
+	Throttles             config.ConsoleThrottles         `json:"throttles"`
+	Remote                string                          `json:"remote"`
+	RemoteQuery           config.RemoteQueryConfiguration `json:"remote_query"`
+	AllowedMounts         []string                        `json:"allowed_mounts"`
+	AllowedOrigins        []string                        `json:"allowed_origins"`
+	AllowCORSPrivateNet   bool                            `json:"allow_cors_private_network"`
+	IgnorePanelUpdates    bool                            `json:"ignore_panel_config_updates"`
+	System                panelUpdateSystemConfiguration  `json:"system"`
 }
 
 type panelUpdateSystemConfiguration struct {
-	Username               string                    `json:"username"`
-	Timezone               string                    `json:"timezone"`
-	User                   panelUpdateSystemUser     `json:"user"`
-	Passwd                 panelUpdateSystemPasswd   `json:"passwd"`
+	Username               string                     `json:"username"`
+	Timezone               string                     `json:"timezone"`
+	User                   panelUpdateSystemUser      `json:"user"`
+	Passwd                 panelUpdateSystemPasswd    `json:"passwd"`
 	MachineID              panelUpdateSystemMachineID `json:"machine_id"`
-	DiskCheckInterval      int64                     `json:"disk_check_interval"`
-	ActivitySendInterval   int                       `json:"activity_send_interval"`
-	ActivitySendCount      int                       `json:"activity_send_count"`
-	CheckPermissionsOnBoot bool                      `json:"check_permissions_on_boot"`
-	EnableLogRotate        bool                      `json:"enable_log_rotate"`
-	WebsocketLogCount      int                       `json:"websocket_log_count"`
-	Sftp                   config.SftpConfiguration  `json:"sftp"`
-	CrashDetection         config.CrashDetection     `json:"crash_detection"`
-	Backups                config.Backups            `json:"backups"`
-	Transfers              config.Transfers          `json:"transfers"`
-	OpenatMode             string                    `json:"openat_mode"`
+	DiskCheckInterval      int64                      `json:"disk_check_interval"`
+	ActivitySendInterval   int                        `json:"activity_send_interval"`
+	ActivitySendCount      int                        `json:"activity_send_count"`
+	CheckPermissionsOnBoot bool                       `json:"check_permissions_on_boot"`
+	EnableLogRotate        bool                       `json:"enable_log_rotate"`
+	WebsocketLogCount      int                        `json:"websocket_log_count"`
+	Sftp                   config.SftpConfiguration   `json:"sftp"`
+	CrashDetection         config.CrashDetection      `json:"crash_detection"`
+	Backups                config.Backups             `json:"backups"`
+	Transfers              config.Transfers           `json:"transfers"`
+	OpenatMode             string                     `json:"openat_mode"`
 }
 
 type panelUpdateSystemUser struct {
@@ -252,6 +252,22 @@ func postUpdateConfiguration(c *gin.Context) {
 		cfg.Api.Ssl.CertificateFile = current.Api.Ssl.CertificateFile
 	}
 
+	// The token that everything authenticates against is a derived value that is
+	// not part of the payload sent by the Panel, so it has to be re-resolved from
+	// the new token values.
+	if err := cfg.ResolveToken(true); err != nil {
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	// Refuse to go any further with a token we could never authenticate against.
+	if cfg.Token.ID == "" || cfg.Token.Token == "" {
+		middleware.CaptureAndAbort(c, errors.New("config: refusing to apply an update with an empty authentication token"))
+		return
+	}
+
+	tokenId, token := cfg.Token.ID, cfg.Token.Token
+
 	// Try to write this new configuration to the disk before updating our global
 	// state with it.
 	if err := config.WriteToDisk(&cfg); err != nil {
@@ -261,6 +277,11 @@ func postUpdateConfiguration(c *gin.Context) {
 	// Since we wrote it to the disk successfully now update the global configuration
 	// state to use this new configuration struct.
 	config.Set(&cfg)
+
+	// Requests we make back to the Panel use credentials that were captured when
+	// the client was created at boot, so they have to be rotated explicitly.
+	middleware.ExtractManager(c).Client().SetCredentials(tokenId, token)
+
 	c.JSON(http.StatusOK, postUpdateConfigurationResponse{
 		Applied: true,
 	})

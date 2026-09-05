@@ -3,8 +3,11 @@ package config
 import (
 	"encoding/base64"
 	"encoding/json"
+	"net/url"
 	"sort"
+	"strings"
 
+	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/registry"
 )
@@ -74,6 +77,28 @@ type DockerConfiguration struct {
 		Cpu    int64 `default:"100" json:"cpu" yaml:"cpu"`
 	} `json:"installer_limits" yaml:"installer_limits"`
 
+	// CpuPeriod is the length of a CFS scheduling window in microseconds. Server
+	// quotas scale with it, so the configured CPU limits stay the same. A shorter
+	// period reduces the worst case throttle latency at the cost of additional
+	// scheduler overhead.
+	CpuPeriod int64 `default:"100000" json:"cpu_period" yaml:"cpu_period"`
+
+	// CpuBurst allows containers to bank unused CFS quota within a period and spend
+	// it on short spikes without raising their long term CPU limit. Percent sizes the
+	// burst relative to a server's quota and is capped at 100 by the kernel. Requires
+	// Linux 5.14 or newer, it is skipped silently otherwise.
+	CpuBurst struct {
+		Enabled bool  `default:"true" json:"enabled" yaml:"enabled"`
+		Percent int64 `default:"100" json:"percent" yaml:"percent"`
+	} `json:"cpu_burst" yaml:"cpu_burst"`
+
+	// CpuShares is the relative CFS weight of server containers when the host is
+	// fully saturated, it limits nothing on an idle host. Zero leaves containers
+	// at the engine default. Wings historically set 1024, which cgroup v2 converts
+	// to less than half of the default weight, set that value to restore the old
+	// bias towards host system services.
+	CpuShares int64 `default:"0" json:"cpu_shares" yaml:"cpu_shares"`
+
 	// Overhead controls the memory overhead given to all containers to circumvent certain
 	// software such as the JVM not staying below the maximum memory limit.
 	Overhead Overhead `json:"overhead" yaml:"overhead"`
@@ -94,6 +119,12 @@ type DockerConfiguration struct {
 	} `json:"log_config" yaml:"log_config"`
 }
 
+// CpuPeriodMicroseconds returns the configured CFS period clamped to the range
+// the kernel accepts.
+func (c DockerConfiguration) CpuPeriodMicroseconds() int64 {
+	return min(max(c.CpuPeriod, 1_000), 1_000_000)
+}
+
 func (c DockerConfiguration) ContainerLogConfig() container.LogConfig {
 	if c.LogConfig.Type == "" {
 		return container.LogConfig{}
@@ -103,6 +134,93 @@ func (c DockerConfiguration) ContainerLogConfig() container.LogConfig {
 		Type:   c.LogConfig.Type,
 		Config: c.LogConfig.Config,
 	}
+}
+
+// RegistryCredentialsForImage returns registry credentials for an image only
+// when the configured registry and image reference share the same registry
+// identity.
+func (c DockerConfiguration) RegistryCredentialsForImage(img string) (string, *RegistryConfiguration) {
+	named, err := reference.ParseNormalizedNamed(img)
+	if err != nil {
+		return "", nil
+	}
+
+	imageDomain := strings.ToLower(reference.Domain(named))
+	imagePath := reference.Path(named)
+	var matchedRegistry string
+	var matchedCredentials RegistryConfiguration
+	matchedScore := -1
+
+	for registry, cfg := range c.Registries {
+		domain, path, ok := parseDockerRegistryReference(registry)
+		if !ok || domain != imageDomain || !registryPathMatchesImage(path, imagePath) {
+			continue
+		}
+
+		score := len(domain) + len(path)
+		if score > matchedScore {
+			matchedRegistry = registry
+			matchedCredentials = cfg
+			matchedScore = score
+		}
+	}
+
+	if matchedScore == -1 {
+		return "", nil
+	}
+
+	return matchedRegistry, &matchedCredentials
+}
+
+func parseDockerRegistryReference(registry string) (string, string, bool) {
+	registry = strings.TrimSpace(registry)
+	if registry == "" {
+		return "", "", false
+	}
+
+	if u, err := url.Parse(registry); err == nil && u.Host != "" {
+		p := strings.Trim(u.Path, "/")
+		if p == "" || p == "v1" || p == "v2" {
+			registry = u.Host
+		} else {
+			registry = u.Host + "/" + p
+		}
+	}
+
+	registry = strings.Trim(registry, "/")
+	if registry == "" {
+		return "", "", false
+	}
+
+	hasPath := strings.Contains(registry, "/")
+	ref := registry
+	if !hasPath {
+		ref += "/wings"
+	}
+
+	named, err := reference.ParseNormalizedNamed(ref)
+	if err != nil {
+		return "", "", false
+	}
+
+	path := ""
+	if hasPath {
+		path = reference.Path(named)
+	}
+	domain := strings.ToLower(reference.Domain(named))
+	if domain == "docker.io" && (path == "v1" || path == "v2") {
+		path = ""
+	}
+
+	return domain, path, true
+}
+
+func registryPathMatchesImage(registryPath string, imagePath string) bool {
+	if registryPath == "" {
+		return true
+	}
+
+	return imagePath == registryPath || strings.HasPrefix(imagePath, registryPath+"/")
 }
 
 // RegistryConfiguration defines the authentication credentials for a given

@@ -31,7 +31,7 @@ func postTransfers(c *gin.Context) {
 	if len(auth) != 2 || auth[0] != "Bearer" {
 		c.Header("WWW-Authenticate", "Bearer")
 		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-			"error": "The required authorization heads were not present in the request.",
+			"error": "The required authorization headers were not present in the request.",
 		})
 		return
 	}

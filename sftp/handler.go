@@ -23,6 +23,7 @@ const (
 	PermissionFileCreate      = "file.create"
 	PermissionFileUpdate      = "file.update"
 	PermissionFileDelete      = "file.delete"
+	sftpAttributeExtended     = 1 << 31
 )
 
 type Handler struct {
@@ -33,6 +34,30 @@ type Handler struct {
 	permissions []string
 	logger      *log.Entry
 	ro          bool
+}
+
+type quotaWriterAt struct {
+	io.WriterAt
+	server *server.Server
+}
+
+func (w quotaWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	if w.server != nil && w.server.IsInProtectedState() {
+		return 0, sftp.ErrSSHFxPermissionDenied
+	}
+
+	n, err := w.WriterAt.WriteAt(p, off)
+	if filesystem.IsErrorCode(err, filesystem.ErrCodeDiskSpace) {
+		return n, ErrSSHQuotaExceeded
+	}
+	return n, err
+}
+
+func (w quotaWriterAt) Close() error {
+	if c, ok := w.WriterAt.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 // NewHandler returns a new connection handler for the SFTP server. This allows a given user
@@ -98,7 +123,7 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	l := h.logger.WithField("source", request.Filepath)
 	// If the user doesn't have enough space left on the server it should respond with an
 	// error since we won't be letting them write this file to the disk.
-	if !h.fs.HasSpaceAvailable(true) {
+	if !h.fs.HasSpaceAvailable(false) {
 		return nil, ErrSSHQuotaExceeded
 	}
 
@@ -134,7 +159,30 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 		event = server.ActivitySftpCreate
 	}
 	h.events.MustLog(event, FileAction{Entity: request.Filepath})
-	return f, nil
+	return quotaWriterAt{WriterAt: f, server: h.server}, nil
+}
+
+func setstatMode(request *sftp.Request) (os.FileMode, error) {
+	// pkg/sftp allocates the client-provided extended attribute count before
+	// validating the remaining packet length. Reject it before parsing to avoid
+	// allowing a small packet to request an effectively unbounded allocation.
+	if request.Flags&sftpAttributeExtended != 0 {
+		return 0, sftp.ErrSSHFxBadMessage
+	}
+	attrs := request.Attributes()
+	if attrs == nil {
+		return 0, sftp.ErrSSHFxBadMessage
+	}
+	mode := attrs.FileMode().Perm()
+	// If the client passes an invalid FileMode just use the default 0644.
+	if mode == 0o000 {
+		mode = os.FileMode(0o644)
+	}
+	// Force directories to be 0755.
+	if attrs.FileMode().IsDir() {
+		mode = 0o755
+	}
+	return mode, nil
 }
 
 // Filecmd hander for basic SFTP system calls related to files, but not anything to do with reading
@@ -155,14 +203,9 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileUpdate) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		mode := request.Attributes().FileMode().Perm()
-		// If the client passes an invalid FileMode just use the default 0644.
-		if mode == 0o000 {
-			mode = os.FileMode(0o644)
-		}
-		// Force directories to be 0755.
-		if request.Attributes().FileMode().IsDir() {
-			mode = 0o755
+		mode, err := setstatMode(request)
+		if err != nil {
+			return err
 		}
 		if err := h.fs.Chmod(request.Filepath, mode); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -289,7 +332,7 @@ func (h *Handler) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
 // Determines if a user has permission to perform a specific action on the SFTP server. These
 // permissions are defined and returned by the Panel API.
 func (h *Handler) can(permission string) bool {
-	if h.server.IsSuspended() {
+	if h.server.IsSuspended() || h.server.IsInProtectedState() {
 		return false
 	}
 	for _, p := range h.permissions {

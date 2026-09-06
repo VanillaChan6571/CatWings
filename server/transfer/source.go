@@ -9,6 +9,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/pterodactyl/wings/internal/progress"
@@ -59,12 +60,13 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 
 	// Create a new multipart writer that writes the archive to the pipe.
 	mp := multipart.NewWriter(writer)
-	defer mp.Close()
 	req.Header.Set("Content-Type", mp.FormDataContentType())
 
 	// Create a new goroutine to write the archive to the pipe used by the
 	// multipart writer.
-	errChan := make(chan error)
+	// The destination can reject the request before this goroutine finishes.
+	// Buffer its result so reporting an error cannot strand the producer.
+	errChan := make(chan error, 1)
 	go func() {
 		defer close(errChan)
 		defer writer.Close()
@@ -83,7 +85,7 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 			return
 		}
 
-		ch := make(chan error)
+		ch := make(chan error, 1)
 		go func() {
 			defer close(ch)
 
@@ -132,8 +134,15 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 		t.Log().Debug("error while sending archive to destination")
 		return nil, err
 	}
+	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code from destination: %d", res.StatusCode)
+		// Preserve the receiving node's error and request ID; the status code alone
+		// hides extraction/checksum failures and makes them look like Panel errors.
+		v, readErr := io.ReadAll(io.LimitReader(res.Body, 8*1024))
+		if readErr != nil {
+			return nil, fmt.Errorf("unexpected status code from destination: %d (reading response: %w)", res.StatusCode, readErr)
+		}
+		return nil, fmt.Errorf("unexpected status code from destination: %d: %s", res.StatusCode, strings.TrimSpace(string(v)))
 	}
 	t.Log().Debug("waiting for stream to complete")
 	select {
@@ -149,7 +158,6 @@ func (t *Transfer) PushArchiveToTarget(url, token string) ([]byte, error) {
 			t.Log().WithError(err).Debug("failed to send archive to destination")
 			return nil, fmt.Errorf("http error: %w, multipart error: %v", err, err2)
 		}
-		defer res.Body.Close()
 		t.Log().Debug("received response from destination")
 
 		v, err := io.ReadAll(res.Body)

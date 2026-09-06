@@ -15,6 +15,7 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
+	"github.com/google/uuid"
 	"github.com/mholt/archives"
 	"golang.org/x/sync/errgroup"
 
@@ -97,13 +98,38 @@ func (b *Backup) Identifier() string {
 	return b.Uuid
 }
 
-// Path returns the path for this specific backup - now using .zip extension
+func (b *Backup) normalizedIdentifier() (string, error) {
+	parsed, err := uuid.Parse(b.Identifier())
+	if err != nil || len(b.Identifier()) != len(parsed.String()) || parsed.String() != strings.ToLower(b.Identifier()) {
+		return "", errors.New("backup: identifier must be a valid UUID")
+	}
+	return parsed.String(), nil
+}
+
+func (b *Backup) validateIdentifier() error {
+	identifier, err := b.normalizedIdentifier()
+	if err != nil {
+		return err
+	}
+	b.Uuid = identifier
+	return nil
+}
+
+// Path returns the path for this specific backup.
 func (b *Backup) Path() string {
-	return path.Join(config.Get().System.BackupDirectory, b.Identifier()+".zip")
+	identifier, err := b.normalizedIdentifier()
+	if err != nil {
+		identifier = path.Base(b.Identifier())
+	}
+	return path.Join(config.Get().System.BackupDirectory, identifier+".zip")
 }
 
 // Size returns the size of the generated backup.
 func (b *Backup) Size() (int64, error) {
+	// Details runs Size and Checksum concurrently; validation here must not mutate Uuid.
+	if _, err := b.normalizedIdentifier(); err != nil {
+		return 0, err
+	}
 	st, err := os.Stat(b.Path())
 	if err != nil {
 		return 0, err
@@ -114,6 +140,9 @@ func (b *Backup) Size() (int64, error) {
 
 // Checksum returns the SHA256 checksum of a backup.
 func (b *Backup) Checksum() ([]byte, error) {
+	if _, err := b.normalizedIdentifier(); err != nil {
+		return nil, err
+	}
 	h := sha1.New()
 
 	f, err := os.Open(b.Path())
@@ -171,11 +200,17 @@ func (b *Backup) WithLogContext(c map[string]interface{}) {
 
 // Remove removes a backup from the system.
 func (b *Backup) Remove() error {
+	if err := b.validateIdentifier(); err != nil {
+		return err
+	}
 	return os.Remove(b.Path())
 }
 
 // Generate creates a ZIP backup of the server files.
 func (b *Backup) Generate(ctx context.Context, fs *filesystem.Filesystem, ignore string) (*ArchiveDetails, error) {
+	if err := b.validateIdentifier(); err != nil {
+		return nil, err
+	}
 	b.logContext = map[string]interface{}{
 		"backup_id": b.Uuid,
 		"adapter":   b.adapter,

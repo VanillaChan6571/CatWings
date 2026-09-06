@@ -1,6 +1,7 @@
 package filesystem
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -189,21 +190,33 @@ func (fs *Filesystem) DecompressFile(ctx context.Context, dir string, file strin
 	})
 }
 
-// ExtractStreamUnsafe .
+// ExtractStreamUnsafe extracts a tar.gz server transfer and consumes the complete
+// compressed stream so the caller can verify its checksum. ZIP backups use a
+// separate restoration path.
 func (fs *Filesystem) ExtractStreamUnsafe(ctx context.Context, dir string, r io.Reader) error {
-	// Update to identify ZIP format instead of tar.gz by default
-	format, input, err := archives.Identify(ctx, "archive.zip", r)
+	// Transfers are always tar.gz. Guessing a ZIP filename can make format
+	// detection select ZIP instead of TAR depending on format iteration order.
+	input, err := gzip.NewReader(r)
 	if err != nil {
-		if errors.Is(err, archives.NoMatch) {
+		if errors.Is(err, gzip.ErrHeader) {
 			return newFilesystemError(ErrCodeUnknownArchive, err)
 		}
 		return err
 	}
-	return fs.extractStream(ctx, extractStreamOptions{
+	defer input.Close()
+	if err := fs.extractStream(ctx, extractStreamOptions{
 		Directory: dir,
-		Format:    format,
+		Format:    archives.Tar{},
 		Reader:    input,
-	})
+	}); err != nil {
+		return err
+	}
+
+	// TAR reaches EOF at its end markers, before gzip necessarily consumes its
+	// trailer. Read through gzip EOF to validate that trailer and hash all bytes
+	// of the multipart archive instead of letting NextPart discard the remainder.
+	_, err = io.Copy(io.Discard, input)
+	return err
 }
 
 type extractStreamOptions struct {

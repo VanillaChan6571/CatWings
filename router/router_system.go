@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -120,97 +121,199 @@ type postUpdateConfigurationResponse struct {
 
 // panelUpdateConfigurationPayload is a constrained request payload for /api/update.
 // It intentionally excludes local filesystem path fields.
+//
+// Every field is a pointer, a slice, or a json.RawMessage so a key the Panel omits
+// stays nil and is left alone. Value types made "absent" and "sent as zero"
+// indistinguishable: the Panel only sends eight top level keys, so every update
+// blanked docker, throttles, remote_query and most of system.
 type panelUpdateConfigurationPayload struct {
-	Debug                 bool                            `json:"debug"`
-	AppName               string                          `json:"app_name"`
-	Uuid                  string                          `json:"uuid"`
-	AuthenticationTokenId string                          `json:"token_id"`
-	AuthenticationToken   string                          `json:"token"`
-	Api                   config.ApiConfiguration         `json:"api"`
-	Docker                config.DockerConfiguration      `json:"docker"`
-	Throttles             config.ConsoleThrottles         `json:"throttles"`
-	Remote                string                          `json:"remote"`
-	RemoteQuery           config.RemoteQueryConfiguration `json:"remote_query"`
+	Debug                 *bool                           `json:"debug"`
+	AppName               *string                         `json:"app_name"`
+	Uuid                  *string                         `json:"uuid"`
+	AuthenticationTokenId *string                         `json:"token_id"`
+	AuthenticationToken   *string                         `json:"token"`
+	Api                   json.RawMessage                 `json:"api"`
+	Docker                json.RawMessage                 `json:"docker"`
+	Throttles             json.RawMessage                 `json:"throttles"`
+	Remote                *string                         `json:"remote"`
+	RemoteQuery           json.RawMessage                 `json:"remote_query"`
 	AllowedMounts         []string                        `json:"allowed_mounts"`
 	AllowedOrigins        []string                        `json:"allowed_origins"`
-	AllowCORSPrivateNet   bool                            `json:"allow_cors_private_network"`
-	IgnorePanelUpdates    bool                            `json:"ignore_panel_config_updates"`
-	System                panelUpdateSystemConfiguration  `json:"system"`
+	AllowCORSPrivateNet   *bool                           `json:"allow_cors_private_network"`
+	IgnorePanelUpdates    *bool                           `json:"ignore_panel_config_updates"`
+	System                *panelUpdateSystemConfiguration `json:"system"`
 }
 
 type panelUpdateSystemConfiguration struct {
-	Username               string                     `json:"username"`
-	Timezone               string                     `json:"timezone"`
-	User                   panelUpdateSystemUser      `json:"user"`
-	Passwd                 panelUpdateSystemPasswd    `json:"passwd"`
-	MachineID              panelUpdateSystemMachineID `json:"machine_id"`
-	DiskCheckInterval      int64                      `json:"disk_check_interval"`
-	ActivitySendInterval   int                        `json:"activity_send_interval"`
-	ActivitySendCount      int                        `json:"activity_send_count"`
-	CheckPermissionsOnBoot bool                       `json:"check_permissions_on_boot"`
-	EnableLogRotate        bool                       `json:"enable_log_rotate"`
-	WebsocketLogCount      int                        `json:"websocket_log_count"`
-	Sftp                   config.SftpConfiguration   `json:"sftp"`
-	CrashDetection         config.CrashDetection      `json:"crash_detection"`
-	Backups                config.Backups             `json:"backups"`
-	Transfers              config.Transfers           `json:"transfers"`
-	OpenatMode             string                     `json:"openat_mode"`
+	Username               *string                     `json:"username"`
+	Timezone               *string                     `json:"timezone"`
+	User                   *panelUpdateSystemUser      `json:"user"`
+	Passwd                 *panelUpdateSystemPasswd    `json:"passwd"`
+	MachineID              *panelUpdateSystemMachineID `json:"machine_id"`
+	DiskCheckInterval      *int64                      `json:"disk_check_interval"`
+	ActivitySendInterval   *int                        `json:"activity_send_interval"`
+	ActivitySendCount      *int                        `json:"activity_send_count"`
+	CheckPermissionsOnBoot *bool                       `json:"check_permissions_on_boot"`
+	EnableLogRotate        *bool                       `json:"enable_log_rotate"`
+	WebsocketLogCount      *int                        `json:"websocket_log_count"`
+	Sftp                   json.RawMessage             `json:"sftp"`
+	CrashDetection         json.RawMessage             `json:"crash_detection"`
+	Backups                json.RawMessage             `json:"backups"`
+	Transfers              json.RawMessage             `json:"transfers"`
+	OpenatMode             *string                     `json:"openat_mode"`
+}
+
+type panelUpdateSystemRootless struct {
+	Enabled      *bool `json:"enabled"`
+	ContainerUID *int  `json:"container_uid"`
+	ContainerGID *int  `json:"container_gid"`
 }
 
 type panelUpdateSystemUser struct {
-	Rootless struct {
-		Enabled      bool `json:"enabled"`
-		ContainerUID int  `json:"container_uid"`
-		ContainerGID int  `json:"container_gid"`
-	} `json:"rootless"`
-	Uid int `json:"uid"`
-	Gid int `json:"gid"`
+	Rootless *panelUpdateSystemRootless `json:"rootless"`
+	Uid      *int                       `json:"uid"`
+	Gid      *int                       `json:"gid"`
 }
 
 type panelUpdateSystemPasswd struct {
-	Enable bool `json:"enabled"`
+	Enable *bool `json:"enabled"`
 }
 
 type panelUpdateSystemMachineID struct {
-	Enable bool `json:"enabled"`
+	Enable *bool `json:"enabled"`
 }
 
-func applyPanelUpdateConfigurationPayload(cfg *config.Configuration, payload *panelUpdateConfigurationPayload) {
-	cfg.Debug = payload.Debug
-	cfg.AppName = payload.AppName
-	cfg.Uuid = payload.Uuid
-	cfg.AuthenticationTokenId = payload.AuthenticationTokenId
-	cfg.AuthenticationToken = payload.AuthenticationToken
-	cfg.Api = payload.Api
-	cfg.Docker = payload.Docker
-	cfg.Throttles = payload.Throttles
-	cfg.PanelLocation = payload.Remote
-	cfg.RemoteQuery = payload.RemoteQuery
-	cfg.AllowedMounts = payload.AllowedMounts
-	cfg.AllowedOrigins = payload.AllowedOrigins
-	cfg.AllowCORSPrivateNetwork = payload.AllowCORSPrivateNet
-	cfg.IgnorePanelConfigUpdates = payload.IgnorePanelUpdates
+// mergePanelConfigurationBlock decodes a nested configuration block onto the value
+// it already holds, so fields the Panel did not mention survive the update.
+func mergePanelConfigurationBlock(raw json.RawMessage, target any, name string) error {
+	if raw == nil {
+		return nil
+	}
+	if err := json.Unmarshal(raw, target); err != nil {
+		return errors.New("config: invalid " + name + " block in panel configuration update: " + err.Error())
+	}
+	return nil
+}
 
-	cfg.System.Username = payload.System.Username
-	cfg.System.Timezone = payload.System.Timezone
-	cfg.System.User.Rootless.Enabled = payload.System.User.Rootless.Enabled
-	cfg.System.User.Rootless.ContainerUID = payload.System.User.Rootless.ContainerUID
-	cfg.System.User.Rootless.ContainerGID = payload.System.User.Rootless.ContainerGID
-	cfg.System.User.Uid = payload.System.User.Uid
-	cfg.System.User.Gid = payload.System.User.Gid
-	cfg.System.Passwd.Enable = payload.System.Passwd.Enable
-	cfg.System.MachineID.Enable = payload.System.MachineID.Enable
-	cfg.System.DiskCheckInterval = payload.System.DiskCheckInterval
-	cfg.System.ActivitySendInterval = payload.System.ActivitySendInterval
-	cfg.System.ActivitySendCount = payload.System.ActivitySendCount
-	cfg.System.CheckPermissionsOnBoot = payload.System.CheckPermissionsOnBoot
-	cfg.System.EnableLogRotate = payload.System.EnableLogRotate
-	cfg.System.WebsocketLogCount = payload.System.WebsocketLogCount
-	cfg.System.Sftp = payload.System.Sftp
-	cfg.System.CrashDetection = payload.System.CrashDetection
-	cfg.System.Backups = payload.System.Backups
-	cfg.System.Transfers = payload.System.Transfers
-	cfg.System.OpenatMode = payload.System.OpenatMode
+// applyPanelUpdateConfigurationPayload copies only the values the Panel actually
+// sent onto cfg. Anything absent from the request is left as it was.
+func applyPanelUpdateConfigurationPayload(cfg *config.Configuration, payload *panelUpdateConfigurationPayload) error {
+	if payload.Debug != nil {
+		cfg.Debug = *payload.Debug
+	}
+	if payload.AppName != nil {
+		cfg.AppName = *payload.AppName
+	}
+	if payload.Uuid != nil {
+		cfg.Uuid = *payload.Uuid
+	}
+	if payload.AuthenticationTokenId != nil {
+		cfg.AuthenticationTokenId = *payload.AuthenticationTokenId
+	}
+	if payload.AuthenticationToken != nil {
+		cfg.AuthenticationToken = *payload.AuthenticationToken
+	}
+	if payload.Remote != nil {
+		cfg.PanelLocation = *payload.Remote
+	}
+	if payload.AllowedMounts != nil {
+		cfg.AllowedMounts = payload.AllowedMounts
+	}
+	if payload.AllowedOrigins != nil {
+		cfg.AllowedOrigins = payload.AllowedOrigins
+	}
+	if payload.AllowCORSPrivateNet != nil {
+		cfg.AllowCORSPrivateNetwork = *payload.AllowCORSPrivateNet
+	}
+	if payload.IgnorePanelUpdates != nil {
+		cfg.IgnorePanelConfigUpdates = *payload.IgnorePanelUpdates
+	}
+
+	if err := mergePanelConfigurationBlock(payload.Api, &cfg.Api, "api"); err != nil {
+		return err
+	}
+	if err := mergePanelConfigurationBlock(payload.Docker, &cfg.Docker, "docker"); err != nil {
+		return err
+	}
+	if err := mergePanelConfigurationBlock(payload.Throttles, &cfg.Throttles, "throttles"); err != nil {
+		return err
+	}
+	if err := mergePanelConfigurationBlock(payload.RemoteQuery, &cfg.RemoteQuery, "remote_query"); err != nil {
+		return err
+	}
+
+	if payload.System == nil {
+		return nil
+	}
+	system := payload.System
+
+	if system.Username != nil {
+		cfg.System.Username = *system.Username
+	}
+	if system.Timezone != nil {
+		cfg.System.Timezone = *system.Timezone
+	}
+	if system.DiskCheckInterval != nil {
+		cfg.System.DiskCheckInterval = *system.DiskCheckInterval
+	}
+	if system.ActivitySendInterval != nil {
+		cfg.System.ActivitySendInterval = *system.ActivitySendInterval
+	}
+	if system.ActivitySendCount != nil {
+		cfg.System.ActivitySendCount = *system.ActivitySendCount
+	}
+	if system.CheckPermissionsOnBoot != nil {
+		cfg.System.CheckPermissionsOnBoot = *system.CheckPermissionsOnBoot
+	}
+	if system.EnableLogRotate != nil {
+		cfg.System.EnableLogRotate = *system.EnableLogRotate
+	}
+	if system.WebsocketLogCount != nil {
+		cfg.System.WebsocketLogCount = *system.WebsocketLogCount
+	}
+	if system.OpenatMode != nil {
+		cfg.System.OpenatMode = *system.OpenatMode
+	}
+	if system.Passwd != nil && system.Passwd.Enable != nil {
+		cfg.System.Passwd.Enable = *system.Passwd.Enable
+	}
+	if system.MachineID != nil && system.MachineID.Enable != nil {
+		cfg.System.MachineID.Enable = *system.MachineID.Enable
+	}
+	if system.User != nil {
+		if system.User.Uid != nil {
+			cfg.System.User.Uid = *system.User.Uid
+		}
+		if system.User.Gid != nil {
+			cfg.System.User.Gid = *system.User.Gid
+		}
+		if system.User.Rootless != nil {
+			if system.User.Rootless.Enabled != nil {
+				cfg.System.User.Rootless.Enabled = *system.User.Rootless.Enabled
+			}
+			if system.User.Rootless.ContainerUID != nil {
+				cfg.System.User.Rootless.ContainerUID = *system.User.Rootless.ContainerUID
+			}
+			if system.User.Rootless.ContainerGID != nil {
+				cfg.System.User.Rootless.ContainerGID = *system.User.Rootless.ContainerGID
+			}
+		}
+	}
+
+	if err := mergePanelConfigurationBlock(system.Sftp, &cfg.System.Sftp, "system.sftp"); err != nil {
+		return err
+	}
+	if err := mergePanelConfigurationBlock(system.CrashDetection, &cfg.System.CrashDetection, "system.crash_detection"); err != nil {
+		return err
+	}
+	if err := mergePanelConfigurationBlock(system.Backups, &cfg.System.Backups, "system.backups"); err != nil {
+		return err
+	}
+	if err := mergePanelConfigurationBlock(system.Transfers, &cfg.System.Transfers, "system.transfers"); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // Updates the running configuration for this Wings instance.
@@ -230,7 +333,10 @@ func postUpdateConfiguration(c *gin.Context) {
 		return
 	}
 
-	applyPanelUpdateConfigurationPayload(&cfg, &payload)
+	if err := applyPanelUpdateConfigurationPayload(&cfg, &payload); err != nil {
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
 
 	// Preserve local filesystem paths from existing daemon config.
 	cfg.System.RootDirectory = current.System.RootDirectory
